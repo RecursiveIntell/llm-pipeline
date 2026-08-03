@@ -4,14 +4,21 @@
 //! cancellation handle, and optional event handler. It is designed to be
 //! constructed once and shared across all payloads in a chain or graph.
 
-use crate::backend::{Backend, BackoffConfig, OllamaBackend};
+#[cfg(feature = "anthropic")]
+use crate::backend::AnthropicBackend;
 #[cfg(feature = "openai")]
 use crate::backend::OpenAiBackend;
+use crate::backend::{Backend, BackoffConfig, OllamaBackend};
+use crate::cost::CostModel;
 use crate::events::EventHandler;
+use crate::limits::PipelineLimits;
+#[allow(deprecated)]
+use crate::trace::TraceId;
 use reqwest::Client;
+use stack_ids::TraceCtx;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -31,6 +38,7 @@ use std::time::Duration;
 ///     .var("audience", "researchers")
 ///     .build();
 /// ```
+#[allow(deprecated)]
 pub struct ExecCtx {
     /// HTTP client (cheap to clone -- uses `Arc` internally).
     pub client: Client,
@@ -46,8 +54,52 @@ pub struct ExecCtx {
     pub cancellation: Option<Arc<AtomicBool>>,
     /// Optional event handler for streaming tokens and lifecycle events.
     pub event_handler: Option<Arc<dyn EventHandler>>,
+    /// Phase status: compatibility / migration-only
+    ///
+    /// Legacy trace ID for correlating this context's operations across crates.
+    /// Auto-generated if not provided. Use [`trace_ctx`](Self::trace_ctx) for
+    /// the canonical trace form on the normal path.
+    ///
+    /// **Removal condition**: removed when all callers migrate to `TraceCtx`.
+    #[deprecated(
+        note = "Use trace_ctx instead. Will be removed when all callers migrate to TraceCtx."
+    )]
+    pub trace_id: TraceId,
+    /// Canonical trace context from `stack_ids`.
+    ///
+    /// This is the normal-path trace form. It supports parent span tracking,
+    /// bounded baggage, and W3C traceparent serialization. Automatically
+    /// generated from `trace_id` if not explicitly set.
+    pub trace_ctx: TraceCtx,
+    /// Resource limits for pipeline operations.
+    pub limits: PipelineLimits,
+    /// Optional cost model for emitting `CostUpdate` events.
+    pub cost_model: Option<CostModel>,
+    /// Optional global token budget for this context.
+    pub token_budget: Option<Arc<AtomicU32>>,
 }
 
+#[allow(deprecated)]
+impl Clone for ExecCtx {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            backend: self.backend.clone(),
+            backoff: self.backoff.clone(),
+            vars: self.vars.clone(),
+            cancellation: self.cancellation.clone(),
+            event_handler: self.event_handler.clone(),
+            trace_id: self.trace_id.clone(),
+            trace_ctx: self.trace_ctx.clone(),
+            limits: self.limits.clone(),
+            cost_model: self.cost_model,
+            token_budget: self.token_budget.clone(),
+        }
+    }
+}
+
+#[allow(deprecated)]
 impl ExecCtx {
     /// Create a new builder.
     pub fn builder(base_url: impl Into<String>) -> ExecCtxBuilder {
@@ -60,6 +112,11 @@ impl ExecCtx {
             cancellation: None,
             event_handler: None,
             timeout: None,
+            trace_id: None,
+            trace_ctx: None,
+            limits: None,
+            cost_model: None,
+            token_budget: None,
         }
     }
 
@@ -84,6 +141,7 @@ impl ExecCtx {
     }
 }
 
+#[allow(deprecated)]
 impl std::fmt::Debug for ExecCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecCtx")
@@ -93,6 +151,9 @@ impl std::fmt::Debug for ExecCtx {
             .field("vars_count", &self.vars.len())
             .field("has_cancellation", &self.cancellation.is_some())
             .field("has_event_handler", &self.event_handler.is_some())
+            .field("trace_id", &self.trace_id)
+            .field("trace_ctx", &self.trace_ctx)
+            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -107,8 +168,14 @@ pub struct ExecCtxBuilder {
     cancellation: Option<Arc<AtomicBool>>,
     event_handler: Option<Arc<dyn EventHandler>>,
     timeout: Option<Duration>,
+    trace_id: Option<TraceId>,
+    trace_ctx: Option<TraceCtx>,
+    limits: Option<PipelineLimits>,
+    cost_model: Option<CostModel>,
+    token_budget: Option<Arc<AtomicU32>>,
 }
 
+#[allow(deprecated)]
 impl ExecCtxBuilder {
     /// Set the HTTP client. If not set, a default client is created.
     pub fn client(mut self, client: Client) -> Self {
@@ -142,6 +209,15 @@ impl ExecCtxBuilder {
         self
     }
 
+    /// Use the Anthropic Messages API backend with the given API key.
+    ///
+    /// Sets the backend to [`AnthropicBackend`] with the given `x-api-key`.
+    #[cfg(feature = "anthropic")]
+    pub fn anthropic_with_key(mut self, api_key: impl Into<String>) -> Self {
+        self.backend = Some(Arc::new(AnthropicBackend::new(api_key)));
+        self
+    }
+
     /// Set the transport retry configuration. Default: [`BackoffConfig::none()`].
     pub fn backoff(mut self, config: BackoffConfig) -> Self {
         self.backoff = Some(config);
@@ -172,9 +248,12 @@ impl ExecCtxBuilder {
         self
     }
 
-    /// Set the request timeout. Default: 60 seconds.
+    /// Set the client-level connection timeout. Default: 5 minutes (safety net).
     ///
-    /// If no custom `Client` is provided, the built client will use this timeout.
+    /// This is a coarse safety net on the `reqwest::Client`. Per-request timeouts
+    /// are applied individually via [`PipelineLimits::request_timeout`] or
+    /// [`LlmCall::with_timeout`](crate::llm_call::LlmCall::with_timeout).
+    ///
     /// If a custom `Client` is provided via `.client()`, this setting is ignored
     /// (the custom client's own timeout applies).
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -182,15 +261,102 @@ impl ExecCtxBuilder {
         self
     }
 
+    /// Phase status: compatibility / migration-only
+    ///
+    /// Set the legacy trace ID for correlating operations. If not set, a random
+    /// UUID v4 is generated automatically.
+    ///
+    /// Prefer [`with_trace_ctx`](Self::with_trace_ctx) for new code.
+    ///
+    /// **Removal condition**: removed when all callers migrate to `TraceCtx`.
+    #[deprecated(
+        since = "0.6.0",
+        note = "Use with_trace_ctx() instead. This method will be removed in v1.0."
+    )]
+    pub fn with_trace_id(mut self, trace_id: TraceId) -> Self {
+        self.trace_id = Some(trace_id);
+        self
+    }
+
+    /// Set the canonical trace context from `stack_ids::TraceCtx`.
+    ///
+    /// This is the normal-path trace form. When set, the legacy `trace_id` field
+    /// is derived from `trace_ctx.trace_id` for backward compatibility.
+    pub fn with_trace_ctx(mut self, trace_ctx: TraceCtx) -> Self {
+        self.trace_ctx = Some(trace_ctx);
+        self
+    }
+
+    /// Set resource limits. If not set, [`PipelineLimits::default()`] is used.
+    pub fn with_limits(mut self, limits: PipelineLimits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
+    /// Set a cost model for estimating and emitting per-call costs.
+    pub fn with_cost_model(mut self, cost_model: CostModel) -> Self {
+        self.cost_model = Some(cost_model);
+        self
+    }
+
+    /// Set a global token budget shared across all invocations using this context.
+    ///
+    /// Each successful backend call adds its reported token usage to the budget.
+    /// Exceeding the budget raises [`PipelineError::BudgetExceeded`](crate::PipelineError::BudgetExceeded).
+    pub fn with_token_budget(mut self, limit: u32) -> Self {
+        self.token_budget = Some(Arc::new(AtomicU32::new(limit)));
+        self
+    }
+
     /// Build the execution context.
+    ///
+    /// **Preferred**: use [`with_trace_ctx()`](Self::with_trace_ctx) to set trace identity.
+    /// The legacy `with_trace_id()` method is deprecated.
+    ///
+    /// Resolution order for trace identity:
+    /// 1. **(Canonical)** If `trace_ctx` was set explicitly via `with_trace_ctx()`, use it. Derive legacy `trace_id` from it at the compatibility boundary.
+    /// 2. **(Legacy/compat)** If only `trace_id` was set via deprecated `with_trace_id()`, derive `trace_ctx` from it.
+    /// 3. **(Default)** If neither was set, generate a fresh `TraceCtx` and derive legacy `trace_id`.
+    ///
+    /// The legacy `trace_id` is always derived — never independently generated — when
+    /// `trace_ctx` is present. This ensures a single source of truth for trace identity.
     pub fn build(self) -> ExecCtx {
-        let timeout = self.timeout.unwrap_or(Duration::from_secs(60));
+        let limits = self.limits.unwrap_or_default();
+        // Use a high safety-net timeout on the Client itself (5 minutes).
+        // Actual per-request timeouts are applied at the RequestBuilder level
+        // by each backend, driven by LlmCall.timeout or PipelineLimits.request_timeout.
+        let client_timeout = self.timeout.unwrap_or(Duration::from_secs(300));
         let client = self.client.unwrap_or_else(|| {
             Client::builder()
-                .timeout(timeout)
+                .timeout(client_timeout)
                 .build()
-                .expect("Failed to build HTTP client")
+                .unwrap_or_else(|e| {
+                    // This is a best-effort fallback. Client construction only
+                    // fails for invalid TLS/config, which we cannot recover from.
+                    tracing::warn!("failed to build HTTP client with timeout: {e}");
+                    Client::new()
+                })
         });
+
+        let (trace_id, trace_ctx) = match (self.trace_ctx, self.trace_id) {
+            // Canonical path: TraceCtx was explicitly set
+            (Some(ctx), _) => {
+                let legacy = TraceId::from_trace_ctx(&ctx);
+                (legacy, ctx)
+            }
+            // Compat path: only legacy TraceId was set
+            (None, Some(id)) => {
+                let ctx = id.to_trace_ctx();
+                (id, ctx)
+            }
+            // Default: generate fresh TraceCtx
+            (None, None) => {
+                let ctx = TraceCtx::generate();
+                let legacy = TraceId::from_trace_ctx(&ctx);
+                (legacy, ctx)
+            }
+        };
+
         ExecCtx {
             client,
             base_url: normalize_base_url(&self.base_url),
@@ -199,6 +365,11 @@ impl ExecCtxBuilder {
             vars: self.vars,
             cancellation: self.cancellation,
             event_handler: self.event_handler,
+            trace_id,
+            trace_ctx,
+            limits,
+            cost_model: self.cost_model,
+            token_budget: self.token_budget,
         }
     }
 }
@@ -210,7 +381,14 @@ impl ExecCtxBuilder {
 fn normalize_base_url(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
     // Strip known suffixes (order matters — longest first)
-    for suffix in &["/v1/chat/completions", "/v1/chat", "/v1", "/api/generate", "/api/chat", "/api"] {
+    for suffix in &[
+        "/v1/chat/completions",
+        "/v1/chat",
+        "/v1",
+        "/api/generate",
+        "/api/chat",
+        "/api",
+    ] {
         if let Some(stripped) = trimmed.strip_suffix(suffix) {
             return stripped.to_string();
         }
@@ -218,26 +396,45 @@ fn normalize_base_url(url: &str) -> String {
     trimmed.to_string()
 }
 
+#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_normalize_base_url_strips_v1() {
-        assert_eq!(normalize_base_url("https://api.openai.com/v1"), "https://api.openai.com");
-        assert_eq!(normalize_base_url("https://api.openai.com/v1/"), "https://api.openai.com");
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/"),
+            "https://api.openai.com"
+        );
     }
 
     #[test]
     fn test_normalize_base_url_strips_api() {
-        assert_eq!(normalize_base_url("http://localhost:11434/api"), "http://localhost:11434");
-        assert_eq!(normalize_base_url("http://localhost:11434/api/"), "http://localhost:11434");
+        assert_eq!(
+            normalize_base_url("http://localhost:11434/api"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:11434/api/"),
+            "http://localhost:11434"
+        );
     }
 
     #[test]
     fn test_normalize_base_url_preserves_clean() {
-        assert_eq!(normalize_base_url("http://localhost:11434"), "http://localhost:11434");
-        assert_eq!(normalize_base_url("https://api.openai.com"), "https://api.openai.com");
+        assert_eq!(
+            normalize_base_url("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com"),
+            "https://api.openai.com"
+        );
     }
 
     #[test]
@@ -250,7 +447,10 @@ mod tests {
 
     #[test]
     fn test_normalize_base_url_trailing_slash() {
-        assert_eq!(normalize_base_url("http://localhost:11434/"), "http://localhost:11434");
+        assert_eq!(
+            normalize_base_url("http://localhost:11434/"),
+            "http://localhost:11434"
+        );
     }
 
     #[test]
@@ -260,5 +460,46 @@ mod tests {
             .timeout(Duration::from_secs(120))
             .build();
         // Smoke test: builds without panic
+    }
+
+    #[test]
+    fn test_trace_ctx_generated_by_default() {
+        let ctx = ExecCtx::builder("http://localhost:11434").build();
+        // Both trace forms should be populated
+        assert!(!ctx.trace_id.as_str().is_empty());
+        assert!(!ctx.trace_ctx.trace_id.is_empty());
+    }
+
+    #[test]
+    fn test_trace_ctx_explicit_sets_legacy() {
+        let trace = TraceCtx::from_trace_id("0af7651916cd43dd8448eb211c80319c");
+        let ctx = ExecCtx::builder("http://localhost:11434")
+            .with_trace_ctx(trace.clone())
+            .build();
+        assert_eq!(ctx.trace_ctx.trace_id, "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(ctx.trace_id.as_str(), "0af7651916cd43dd8448eb211c80319c");
+    }
+
+    #[test]
+    fn test_legacy_trace_id_derives_trace_ctx() {
+        let id = TraceId::from_string("my-legacy-trace");
+        let ctx = ExecCtx::builder("http://localhost:11434")
+            .with_trace_id(id)
+            .build();
+        assert_eq!(ctx.trace_id.as_str(), "my-legacy-trace");
+        assert_eq!(ctx.trace_ctx.trace_id, "my-legacy-trace");
+    }
+
+    #[test]
+    fn test_trace_ctx_takes_priority_over_trace_id() {
+        let trace = TraceCtx::from_trace_id("canonical-trace");
+        let id = TraceId::from_string("legacy-trace");
+        let ctx = ExecCtx::builder("http://localhost:11434")
+            .with_trace_id(id)
+            .with_trace_ctx(trace)
+            .build();
+        // TraceCtx wins
+        assert_eq!(ctx.trace_ctx.trace_id, "canonical-trace");
+        assert_eq!(ctx.trace_id.as_str(), "canonical-trace");
     }
 }

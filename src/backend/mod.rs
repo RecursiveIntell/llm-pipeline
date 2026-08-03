@@ -10,32 +10,41 @@
 //! LlmCall ──► LlmRequest ──► Backend::complete() ──► LlmResponse
 //!                                    │
 //!                         ┌──────────┴──────────┐
-//!                    OllamaBackend         OpenAiBackend
-//!                   /api/generate          /v1/chat/completions
-//!                   /api/chat              SSE streaming
+//!                    OllamaBackend         OpenAiBackend        AnthropicBackend
+//!                   /api/generate          /v1/chat/completions  /v1/messages
+//!                   /api/chat              SSE streaming          SSE streaming
 //!                   NDJSON streaming
 //! ```
 
+#[cfg(feature = "anthropic")]
+pub mod anthropic;
 pub mod backoff;
 pub mod mock;
 pub mod ollama;
 #[cfg(feature = "openai")]
 pub mod openai;
-#[cfg(feature = "openai")]
+pub mod recording;
+#[cfg(any(feature = "openai", feature = "anthropic"))]
 pub mod sse;
 
+#[cfg(feature = "anthropic")]
+pub use anthropic::AnthropicBackend;
 pub use backoff::BackoffConfig;
 pub use mock::MockBackend;
 pub use ollama::OllamaBackend;
 #[cfg(feature = "openai")]
 pub use openai::OpenAiBackend;
+pub use recording::RecordingBackend;
 
 use crate::client::LlmConfig;
+use crate::constraints::GenerationConstraint;
 use crate::error::Result;
+use crate::payload::TokenUsage;
 use crate::PipelineError;
 use async_trait::async_trait;
 use reqwest::Client;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Type alias for the callback invoked before each transport retry.
 ///
@@ -62,11 +71,56 @@ pub struct LlmRequest {
     /// Empty for initial calls.
     pub messages: Vec<ChatMessage>,
 
-    /// LLM configuration (temperature, max_tokens, json_mode, etc.).
+    /// LLM configuration (temperature, tokens, json_mode, etc.).
     pub config: LlmConfig,
+
+    /// Optional constrained decoding instruction for providers that support it.
+    pub constraint: GenerationConstraint,
+
+    /// Optional per-call cap on `max_tokens` / `num_predict`, independent of
+    /// `LlmConfig::max_tokens`. This lets `PipelineLimits::max_tokens_per_call`
+    /// clamp generation without mutating the user's config.
+    pub max_tokens_limit: Option<u32>,
 
     /// Whether to use the streaming endpoint.
     pub stream: bool,
+
+    /// Per-request timeout applied at the HTTP `RequestBuilder` level.
+    ///
+    /// When `Some`, each HTTP request to the LLM provider uses this timeout
+    /// instead of the client-level default. This allows mixed-latency payloads
+    /// (e.g., a 5 s classifier and a 120 s generator) to coexist on the same
+    /// `ExecCtx` without sharing a single baked-in timeout.
+    ///
+    /// Populated by [`LlmCall`](crate::llm_call::LlmCall) from its own
+    /// `timeout` field, falling back to [`PipelineLimits::request_timeout`](crate::limits::PipelineLimits::request_timeout).
+    pub request_timeout: Option<Duration>,
+}
+
+/// Provider-specific metadata returned by a backend.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProviderMeta {
+    /// Provider's own request/response ID, if returned.
+    pub request_id: Option<String>,
+    /// Rate limit remaining tokens, if reported in headers.
+    pub rate_limit_remaining: Option<u64>,
+    /// Rate limit reset timestamp, if reported.
+    pub rate_limit_reset: Option<String>,
+    /// Provider-specific response headers or metadata as raw JSON.
+    pub raw: Option<serde_json::Value>,
+}
+
+impl ProviderMeta {
+    /// Extract common metadata from provider response headers / JSON.
+    pub fn from_headers_and_json(
+        _headers: &reqwest::header::HeaderMap,
+        json: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            raw: json,
+            ..Default::default()
+        }
+    }
 }
 
 /// A single message in a chat conversation.
@@ -101,6 +155,21 @@ pub struct LlmResponse {
     /// Provider-specific metadata (token counts, timing, model info).
     /// Stored as raw JSON — each provider returns different fields.
     pub metadata: Option<serde_json::Value>,
+
+    /// Provider-specific metadata extracted from headers / response body.
+    pub provider_meta: ProviderMeta,
+
+    /// Normalized token accounting, if reported by the provider.
+    pub token_usage: Option<TokenUsage>,
+
+    /// Provider finish reason, such as `"stop"`, `"length"`, or `"tool_calls"`.
+    pub finish_reason: Option<String>,
+
+    /// Time until the first generated token was observed.
+    pub ttft_ms: Option<u64>,
+
+    /// Whether the provider reported a prompt-cache hit.
+    pub cache_hit: bool,
 }
 
 /// Abstraction over LLM providers.
@@ -138,6 +207,36 @@ pub trait Backend: Send + Sync {
 
     /// Human-readable name for logging and diagnostics.
     fn name(&self) -> &'static str;
+
+    /// Does this backend support tool/function calling?
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    /// Does this backend support streaming completions?
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// Does this backend support structured output via JSON schema?
+    fn supports_json_schema(&self) -> bool {
+        false
+    }
+
+    /// Does this backend support grammar-based constrained decoding?
+    fn supports_grammar(&self) -> bool {
+        false
+    }
+
+    /// Does this backend support regex-based constrained decoding?
+    fn supports_regex(&self) -> bool {
+        false
+    }
+
+    /// Maximum context length for this backend, if known.
+    fn max_context_tokens(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Check whether a [`PipelineError`] is retryable based on the backoff config.
@@ -405,7 +504,10 @@ mod tests {
             prompt: "test".into(),
             messages: Vec::new(),
             config: LlmConfig::default(),
+            constraint: crate::GenerationConstraint::default(),
+            max_tokens_limit: None,
             stream: false,
+            request_timeout: None,
         };
 
         let result = with_backoff(

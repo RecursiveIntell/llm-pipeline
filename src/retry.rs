@@ -8,6 +8,75 @@
 use serde_json::Value;
 use std::sync::Arc;
 
+/// Configurable temperature schedule for semantic retry cool-down.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoolDownSchedule {
+    /// Fixed temperature decrement per retry attempt.
+    Fixed(f64),
+    /// Linear: subtract a fixed step each attempt, clamped at `min`.
+    Linear { initial: f64, step: f64, min: f64 },
+    /// Exponential: multiply by `factor` each attempt, clamped at `min`.
+    Exponential { initial: f64, factor: f64, min: f64 },
+    /// Adaptive: hand-written schedule, one decrement per attempt.
+    Adaptive(Vec<f64>),
+}
+
+impl Default for CoolDownSchedule {
+    fn default() -> Self {
+        Self::Fixed(0.2)
+    }
+}
+
+impl CoolDownSchedule {
+    /// Temperature decrement for attempt `n` (1-based), given base temperature.
+    /// Returns the amount to subtract from the base temperature.
+    pub fn decrement_for(&self, n: u32) -> f64 {
+        match self {
+            CoolDownSchedule::Fixed(d) => *d,
+            CoolDownSchedule::Linear { step, .. } => *step,
+            CoolDownSchedule::Exponential {
+                initial, factor, ..
+            } => initial * factor.powi(n.saturating_sub(1) as i32),
+            CoolDownSchedule::Adaptive(schedule) => schedule
+                .get(n.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or_else(|| schedule.last().copied().unwrap_or(0.0)),
+        }
+    }
+
+    /// Apply the cool-down schedule to a base temperature for attempt `n`.
+    pub fn apply(&self, base: f64, n: u32) -> f64 {
+        let decrement = self.decrement_for(n);
+        match self {
+            CoolDownSchedule::Linear { min, .. } | CoolDownSchedule::Exponential { min, .. } => {
+                (base - decrement).max(*min)
+            }
+            _ => (base - decrement).max(0.0),
+        }
+    }
+}
+
+/// Parallel retry strategy for semantic retry.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum RetryStrategy {
+    /// Current behavior: attempt → fail → correct → try again.
+    #[default]
+    Sequential,
+    /// Fan out `n` concurrent calls with the given temperatures and pick the
+    /// first successful parse.
+    BestOfN { n: u32, temperatures: Vec<f64> },
+}
+
+/// Exhaustion behavior when `BestOfN` fails all parallel attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BestOfNExhaustion {
+    /// Fall back to sequential retry with the configured max_retries.
+    #[default]
+    SequentialFallback,
+    /// Return the aggregate error immediately.
+    ReturnError,
+}
+
 /// Type alias for the semantic validator function used in [`RetryConfig`].
 pub type ValidatorFn = Arc<dyn Fn(&str, &Value) -> Result<(), String> + Send + Sync>;
 
@@ -35,6 +104,8 @@ pub type ValidatorFn = Arc<dyn Fn(&str, &Value) -> Result<(), String> + Send + S
 /// ```
 #[derive(Clone)]
 pub struct RetryConfig {
+    pub cool_down_schedule: CoolDownSchedule,
+    pub strategy: RetryStrategy,
     /// Maximum retry attempts (not counting the initial call). Range: 1-5.
     pub max_retries: u32,
 
@@ -50,6 +121,8 @@ pub struct RetryConfig {
     /// Lower temperature on each retry. Default: `true`.
     /// Drops by 0.2 per retry (floored at 0.0).
     pub cool_down: bool,
+    /// Behavior when `BestOfN` exhausts all parallel attempts without success.
+    pub best_of_n_exhaustion: BestOfNExhaustion,
 }
 
 impl RetryConfig {
@@ -59,6 +132,9 @@ impl RetryConfig {
             max_retries: max_retries.min(5),
             validator: None,
             cool_down: true,
+            cool_down_schedule: CoolDownSchedule::default(),
+            strategy: RetryStrategy::default(),
+            best_of_n_exhaustion: BestOfNExhaustion::default(),
         }
     }
 
@@ -96,6 +172,25 @@ impl RetryConfig {
         self.cool_down = false;
         self
     }
+    pub fn with_cool_down_schedule(mut self, schedule: CoolDownSchedule) -> Self {
+        self.cool_down_schedule = schedule;
+        self
+    }
+
+    /// Select concurrent best-of-N retries.
+    pub fn best_of_n(mut self, n: u32, temperatures: Vec<f64>) -> Self {
+        self.strategy = RetryStrategy::BestOfN {
+            n: n.max(1),
+            temperatures,
+        };
+        self
+    }
+
+    /// Set exhaustion behavior for `BestOfN`.
+    pub fn with_best_of_n_exhaustion(mut self, exhaustion: BestOfNExhaustion) -> Self {
+        self.best_of_n_exhaustion = exhaustion;
+        self
+    }
 }
 
 impl std::fmt::Debug for RetryConfig {
@@ -104,6 +199,8 @@ impl std::fmt::Debug for RetryConfig {
             .field("max_retries", &self.max_retries)
             .field("has_validator", &self.validator.is_some())
             .field("cool_down", &self.cool_down)
+            .field("strategy", &self.strategy)
+            .field("best_of_n_exhaustion", &self.best_of_n_exhaustion)
             .finish()
     }
 }

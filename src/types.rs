@@ -1,6 +1,111 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ---------------------------------------------------------------------------
+// Receipt types for pipeline execution auditing
+// ---------------------------------------------------------------------------
+
+/// Outcome of a pipeline execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionOutcome {
+    Success,
+    StageFailed(String),
+    Cancelled,
+    InternalError(String),
+}
+
+/// Retry cause classification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RetryCause {
+    ParseError(String),
+    ValidationError(String),
+    TransportError(String),
+    RateLimited,
+    Other(String),
+}
+
+/// Retry decision classification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RetryDecision {
+    Retrying,
+    GivingUp,
+    FallingBack(String),
+}
+
+/// Budget debit record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetDebitV1 {
+    pub budget_id: String,
+    pub debit: f64,
+    pub remaining: f64,
+}
+
+/// Provider call receipt — one per LLM call made during pipeline execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCallReceiptV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_receipt_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracestate: Option<String>,
+    pub receipt_id: String,
+    pub provider: String,
+    pub model_route: String,
+    pub request_digest: String,
+    pub response_digest: String,
+    pub latency_ms: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+/// Retry decision receipt — one per retry attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryDecisionReceiptV1 {
+    pub receipt_id: String,
+    pub attempt_number: u32,
+    pub max_attempts: u32,
+    pub cause: RetryCause,
+    pub decision: RetryDecision,
+    pub budget_impact: BudgetDebitV1,
+}
+
+/// Complete pipeline execution receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineExecutionReceiptV1 {
+    #[serde(default = "default_receipt_version")]
+    pub receipt_version: String,
+    #[serde(default = "default_crate_version")]
+    pub crate_version: String,
+    #[serde(default)]
+    pub integrity_tag: Option<String>,
+    #[serde(default)]
+    pub previous_receipt_digest: Option<String>,
+    #[serde(default)]
+    pub traceparent: Option<String>,
+    #[serde(default)]
+    pub tracestate: Option<String>,
+    #[serde(default)]
+    pub chain_valid: bool,
+    pub receipt_id: String,
+    pub pipeline_id: String,
+    pub provider_calls: Vec<ProviderCallReceiptV1>,
+    pub retry_decisions: Vec<RetryDecisionReceiptV1>,
+    pub budget_debits: Vec<BudgetDebitV1>,
+    pub response_digest: String,
+    pub outcome: ExecutionOutcome,
+    pub recorded_time: chrono::DateTime<chrono::Utc>,
+}
+
+fn default_receipt_version() -> String {
+    "1".to_string()
+}
+fn default_crate_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 /// Input to a pipeline execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineInput {

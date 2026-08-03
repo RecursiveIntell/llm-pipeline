@@ -8,8 +8,10 @@
 //! Streaming: SSE with `data: {"choices": [{"delta": {"content": "token"}}]}`.
 
 use super::sse::SseDecoder;
-use super::{Backend, LlmRequest, LlmResponse, Role};
+use super::{Backend, LlmRequest, LlmResponse, ProviderMeta, Role};
+use crate::constraints::GenerationConstraint;
 use crate::error::Result;
+use crate::payload::TokenUsage;
 use crate::PipelineError;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -40,13 +42,16 @@ pub struct OpenAiBackend {
 impl std::fmt::Debug for OpenAiBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiBackend")
-            .field("api_key", &self.api_key.as_ref().map(|k| {
-                if k.len() > 6 {
-                    format!("{}***", &k[..6])
-                } else {
-                    "***".to_string()
-                }
-            }))
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|k| {
+                    if k.len() > 6 {
+                        format!("{}***", &k[..6])
+                    } else {
+                        "***".to_string()
+                    }
+                }),
+            )
             .field("organization", &self.organization)
             .finish()
     }
@@ -113,12 +118,15 @@ impl OpenAiBackend {
     }
 
     /// Build the request body for `/v1/chat/completions`.
-    fn build_body(request: &LlmRequest, stream: bool) -> Value {
+    fn build_body(request: &LlmRequest, stream: bool, max_tokens_limit: Option<u32>) -> Value {
+        let max_tokens = max_tokens_limit
+            .map(|limit| request.config.max_tokens.min(limit))
+            .unwrap_or(request.config.max_tokens);
         let mut body = json!({
             "model": request.model,
             "messages": Self::build_messages(request),
             "temperature": request.config.temperature,
-            "max_tokens": request.config.max_tokens,
+            "max_tokens": max_tokens,
             "stream": stream,
         });
 
@@ -126,8 +134,26 @@ impl OpenAiBackend {
             body["response_format"] = json!({"type": "json_object"});
         }
 
-        // Note: `thinking` / `extended_thinking` are skipped silently for OpenAI.
-        // Custom options are also skipped — they're Ollama-specific.
+        match &request.constraint {
+            GenerationConstraint::None => {}
+            GenerationConstraint::JsonSchema(schema) => {
+                body["response_format"] = json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_output",
+                        "schema": schema,
+                        "strict": true,
+                    },
+                });
+            }
+            GenerationConstraint::Grammar(_grammar) => {
+                // OpenAI does not expose grammar constraints; ignore silently
+                // so higher layers can decide to error via preflight.
+            }
+            GenerationConstraint::Regex(_regex) => {
+                // OpenAI does not expose regex constraints; ignore silently.
+            }
+        }
 
         body
     }
@@ -140,15 +166,19 @@ impl OpenAiBackend {
         None
     }
 
-    /// Build the reqwest request with appropriate headers.
+    /// Build the reqwest request with appropriate headers and optional per-request timeout.
     fn build_http_request(
         &self,
         client: &Client,
         url: &str,
         body: &Value,
+        request_timeout: Option<std::time::Duration>,
     ) -> reqwest::RequestBuilder {
         let mut req = client.post(url).json(body);
 
+        if let Some(timeout) = request_timeout {
+            req = req.timeout(timeout);
+        }
         if let Some(ref key) = self.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
@@ -177,6 +207,35 @@ impl OpenAiBackend {
             Some(Value::Object(meta))
         }
     }
+
+    /// Extract normalized token usage from an OpenAI response.
+    fn extract_token_usage(json_resp: &Value) -> Option<TokenUsage> {
+        let usage = json_resp.get("usage")?;
+        let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64())? as u32;
+        let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64())? as u32;
+        let cache_read_tokens = usage.get("prompt_tokens_details").and_then(|d| {
+            d.get("cached_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+        });
+        Some(TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens: None,
+        })
+    }
+
+    /// Extract finish reason from the first OpenAI choice.
+    fn extract_finish_reason(json_resp: &Value) -> Option<String> {
+        json_resp
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
 }
 
 impl Default for OpenAiBackend {
@@ -195,10 +254,10 @@ impl Backend for OpenAiBackend {
     ) -> Result<LlmResponse> {
         let base = base_url.trim_end_matches('/');
         let url = format!("{}/v1/chat/completions", base);
-        let body = Self::build_body(request, false);
+        let body = Self::build_body(request, false, None);
 
         let resp = self
-            .build_http_request(client, &url, &body)
+            .build_http_request(client, &url, &body, request.request_timeout)
             .send()
             .await
             .map_err(|e| {
@@ -236,6 +295,11 @@ impl Backend for OpenAiBackend {
             text,
             status,
             metadata: Self::extract_metadata(&json_resp),
+            provider_meta: ProviderMeta::default(),
+            token_usage: Self::extract_token_usage(&json_resp),
+            finish_reason: Self::extract_finish_reason(&json_resp),
+            ttft_ms: None,
+            cache_hit: false,
         })
     }
 
@@ -248,10 +312,10 @@ impl Backend for OpenAiBackend {
     ) -> Result<LlmResponse> {
         let base = base_url.trim_end_matches('/');
         let url = format!("{}/v1/chat/completions", base);
-        let body = Self::build_body(request, true);
+        let body = Self::build_body(request, true, None);
 
         let resp = self
-            .build_http_request(client, &url, &body)
+            .build_http_request(client, &url, &body, request.request_timeout)
             .send()
             .await
             .map_err(|e| {
@@ -316,11 +380,28 @@ impl Backend for OpenAiBackend {
             text: accumulated,
             status,
             metadata: None,
+            provider_meta: ProviderMeta::default(),
+            token_usage: None,
+            finish_reason: None,
+            ttft_ms: None,
+            cache_hit: false,
         })
     }
 
     fn name(&self) -> &'static str {
         "openai"
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_json_schema(&self) -> bool {
+        true
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
     }
 }
 
@@ -337,7 +418,10 @@ mod tests {
             prompt: "Why is the sky blue?".into(),
             messages: Vec::new(),
             config: LlmConfig::default(),
+            constraint: crate::GenerationConstraint::default(),
+            max_tokens_limit: None,
             stream: false,
+            request_timeout: None,
         }
     }
 
@@ -346,14 +430,17 @@ mod tests {
         let mut request = test_request();
         request.system_prompt = Some("You are a helpful assistant.".into());
 
-        let body = OpenAiBackend::build_body(&request, false);
+        let body = OpenAiBackend::build_body(&request, false, None);
 
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["temperature"], 0.7);
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["stream"], false);
 
-        let messages = body["messages"].as_array().expect("messages");
+        let messages = match body["messages"].as_array() {
+            Some(messages) => messages,
+            None => panic!("messages"),
+        };
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "You are a helpful assistant.");
@@ -369,17 +456,23 @@ mod tests {
         let mut request = test_request();
         request.config.json_mode = true;
 
-        let body = OpenAiBackend::build_body(&request, false);
-        let rf = body.get("response_format").expect("response_format");
+        let body = OpenAiBackend::build_body(&request, false, None);
+        let rf = match body.get("response_format") {
+            Some(rf) => rf,
+            None => panic!("response_format"),
+        };
         assert_eq!(rf["type"], "json_object");
     }
 
     #[test]
     fn test_openai_backend_no_system() {
         let request = test_request();
-        let body = OpenAiBackend::build_body(&request, false);
+        let body = OpenAiBackend::build_body(&request, false, None);
 
-        let messages = body["messages"].as_array().expect("messages");
+        let messages = match body["messages"].as_array() {
+            Some(messages) => messages,
+            None => panic!("messages"),
+        };
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
     }
@@ -389,7 +482,7 @@ mod tests {
         let mut request = test_request();
         request.config.thinking = true;
 
-        let body = OpenAiBackend::build_body(&request, false);
+        let body = OpenAiBackend::build_body(&request, false, None);
         // thinking/extended_thinking should NOT appear in the body
         assert!(body.get("thinking").is_none());
         assert!(body.get("extended_thinking").is_none());
@@ -400,7 +493,7 @@ mod tests {
         let mut request = test_request();
         request.config.options = Some(json!({"top_p": 0.9}));
 
-        let body = OpenAiBackend::build_body(&request, false);
+        let body = OpenAiBackend::build_body(&request, false, None);
         // Custom Ollama options should not appear
         assert!(body.get("options").is_none());
         assert!(body.get("top_p").is_none());
@@ -414,18 +507,29 @@ mod tests {
 
         let client = Client::new();
         let body = json!({"test": true});
-        let req = backend
-            .build_http_request(&client, "https://api.openai.com/v1/chat/completions", &body)
+        let req = match backend
+            .build_http_request(
+                &client,
+                "https://api.openai.com/v1/chat/completions",
+                &body,
+                None,
+            )
             .build()
-            .expect("build request");
+        {
+            Ok(req) => req,
+            Err(err) => panic!("build request: {err}"),
+        };
 
-        let auth = req.headers().get("Authorization").expect("auth header");
+        let auth = match req.headers().get("Authorization") {
+            Some(auth) => auth,
+            None => panic!("auth header"),
+        };
         assert_eq!(auth, "Bearer sk-test123");
 
-        let org = req
-            .headers()
-            .get("OpenAI-Organization")
-            .expect("org header");
+        let org = match req.headers().get("OpenAI-Organization") {
+            Some(org) => org,
+            None => panic!("org header"),
+        };
         assert_eq!(org, "org-abc");
     }
 
@@ -435,10 +539,18 @@ mod tests {
 
         let client = Client::new();
         let body = json!({"test": true});
-        let req = backend
-            .build_http_request(&client, "https://api.openai.com/v1/chat/completions", &body)
+        let req = match backend
+            .build_http_request(
+                &client,
+                "https://api.openai.com/v1/chat/completions",
+                &body,
+                None,
+            )
             .build()
-            .expect("build request");
+        {
+            Ok(req) => req,
+            Err(err) => panic!("build request: {err}"),
+        };
 
         assert!(req.headers().get("Authorization").is_none());
         assert!(req.headers().get("OpenAI-Organization").is_none());
@@ -447,7 +559,7 @@ mod tests {
     #[test]
     fn test_openai_backend_streaming_body() {
         let request = test_request();
-        let body = OpenAiBackend::build_body(&request, true);
+        let body = OpenAiBackend::build_body(&request, true, None);
         assert_eq!(body["stream"], true);
     }
 
@@ -470,8 +582,11 @@ mod tests {
             },
         ];
 
-        let body = OpenAiBackend::build_body(&request, false);
-        let messages = body["messages"].as_array().expect("messages");
+        let body = OpenAiBackend::build_body(&request, false, None);
+        let messages = match body["messages"].as_array() {
+            Some(messages) => messages,
+            None => panic!("messages"),
+        };
         // system + 3 history messages
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "system");
@@ -484,16 +599,28 @@ mod tests {
     fn test_debug_redacts_api_key() {
         let backend = OpenAiBackend::new().with_api_key("sk-1234567890abcdef");
         let debug_output = format!("{:?}", backend);
-        assert!(!debug_output.contains("1234567890abcdef"), "API key must not appear in Debug output");
-        assert!(debug_output.contains("sk-123"), "Prefix should be visible for identification");
-        assert!(debug_output.contains("***"), "Redaction marker must be present");
+        assert!(
+            !debug_output.contains("1234567890abcdef"),
+            "API key must not appear in Debug output"
+        );
+        assert!(
+            debug_output.contains("sk-123"),
+            "Prefix should be visible for identification"
+        );
+        assert!(
+            debug_output.contains("***"),
+            "Redaction marker must be present"
+        );
     }
 
     #[test]
     fn test_debug_no_key() {
         let backend = OpenAiBackend::new();
         let debug_output = format!("{:?}", backend);
-        assert!(debug_output.contains("None"), "No-key case should show None");
+        assert!(
+            debug_output.contains("None"),
+            "No-key case should show None"
+        );
     }
 
     #[test]

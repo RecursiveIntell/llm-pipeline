@@ -1,5 +1,6 @@
 use crate::{
-    error::Result, parsing, streaming::StreamingDecoder, types::StageOutput, PipelineError,
+    constraints::GenerationConstraint, error::Result, parsing, streaming::StreamingDecoder,
+    types::StageOutput, PipelineError,
 };
 use futures::StreamExt;
 use reqwest::Client;
@@ -22,6 +23,9 @@ pub struct LlmConfig {
 
     /// Custom options merged into the Ollama options object.
     pub options: Option<Value>,
+
+    /// Optional structured generation constraint.
+    pub constraint: GenerationConstraint,
 }
 
 impl Default for LlmConfig {
@@ -32,6 +36,7 @@ impl Default for LlmConfig {
             thinking: false,
             json_mode: false,
             options: None,
+            constraint: GenerationConstraint::None,
         }
     }
 }
@@ -55,6 +60,27 @@ impl LlmConfig {
     pub fn with_json_mode(mut self, enabled: bool) -> Self {
         self.json_mode = enabled;
         self
+    }
+
+    /// Set a structured generation constraint.
+    pub fn with_constraint(mut self, constraint: GenerationConstraint) -> Self {
+        self.constraint = constraint;
+        self
+    }
+
+    /// Set a JSON schema constraint.
+    pub fn with_json_schema(self, schema: Value) -> Self {
+        self.with_constraint(GenerationConstraint::JsonSchema(schema))
+    }
+
+    /// Set a grammar constraint.
+    pub fn with_grammar(self, grammar: impl Into<String>) -> Self {
+        self.with_constraint(GenerationConstraint::Grammar(grammar.into()))
+    }
+
+    /// Set a regular-expression constraint.
+    pub fn with_regex(self, regex: impl Into<String>) -> Self {
+        self.with_constraint(GenerationConstraint::Regex(regex.into()))
     }
 }
 

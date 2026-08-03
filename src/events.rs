@@ -5,6 +5,7 @@
 //! Users can implement [`EventHandler`] to receive these events for
 //! logging, progress tracking, or streaming UIs.
 
+use stack_ids::{AttemptId, TrialId};
 use std::sync::Arc;
 
 /// Events emitted during payload execution.
@@ -39,6 +40,10 @@ pub enum Event {
         attempt: u32,
         /// Why the retry was triggered (parse error or validator message).
         reason: String,
+        /// Logical retry family identifier.
+        attempt_id: AttemptId,
+        /// Concrete execution identifier for this trial.
+        trial_id: TrialId,
     },
     /// A semantic retry sequence has completed.
     RetryEnd {
@@ -48,6 +53,8 @@ pub enum Event {
         attempts: u32,
         /// Whether the final attempt succeeded.
         success: bool,
+        /// Logical retry family identifier.
+        attempt_id: AttemptId,
     },
     /// A partial parse result from streaming JSON.
     PartialParse {
@@ -68,6 +75,17 @@ pub enum Event {
         delay_ms: u64,
         /// Reason for the retry (error description).
         reason: String,
+    },
+    /// Estimated monetary cost update for a completed LLM call.
+    CostUpdate {
+        /// Instance name of the payload.
+        name: String,
+        /// Estimated cost in the smallest currency unit (e.g. USD).
+        estimated_cost: f64,
+        /// Currency code, typically `"USD"`.
+        currency: String,
+        /// Token usage that produced this cost.
+        token_usage: crate::payload::TokenUsage,
     },
 }
 

@@ -8,6 +8,7 @@
 use crate::{
     backend::{self, ChatMessage, LlmRequest, LlmResponse},
     client::LlmConfig,
+    constraints::GenerationConstraint,
     diagnostics::ParseDiagnostics,
     error::Result,
     events::{emit, Event},
@@ -17,9 +18,16 @@ use crate::{
     parsing,
     payload::{BoxFut, Payload, PayloadOutput},
     retry::RetryConfig,
+    PipelineError,
 };
+use futures::future::join_all;
+use llm_output_parser::ParseOptions;
 use serde_json::{json, Value};
+use stack_ids::{AttemptId, TrialId};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant as StdInstant};
+use tokio::sync::{mpsc, watch};
 
 /// An LLM call payload that invokes a backend with output strategy and optional retry.
 ///
@@ -55,6 +63,32 @@ pub struct LlmCall {
     output_strategy: OutputStrategy,
     /// Optional semantic retry configuration.
     retry: Option<RetryConfig>,
+    /// Optional per-request timeout for this payload's HTTP calls.
+    ///
+    /// When `Some`, this timeout is applied to each individual HTTP request
+    /// via `reqwest::RequestBuilder::timeout()`. When `None`, the timeout
+    /// falls back to [`PipelineLimits::request_timeout`](crate::limits::PipelineLimits::request_timeout)
+    /// from the [`ExecCtx`].
+    ///
+    /// This enables mixed-latency payloads on the same context -- e.g., a
+    /// 5 s classifier and a 120 s generator can each have their own timeout.
+    timeout: Option<Duration>,
+}
+
+impl Clone for LlmCall {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            prompt_template: self.prompt_template.clone(),
+            system_template: self.system_template.clone(),
+            model: self.model.clone(),
+            config: self.config.clone(),
+            streaming: self.streaming,
+            output_strategy: self.output_strategy.clone(),
+            retry: self.retry.clone(),
+            timeout: self.timeout,
+        }
+    }
 }
 
 impl LlmCall {
@@ -69,6 +103,7 @@ impl LlmCall {
             streaming: false,
             output_strategy: OutputStrategy::default(),
             retry: None,
+            timeout: None,
         }
     }
 
@@ -107,6 +142,11 @@ impl LlmCall {
         self.retry.as_ref()
     }
 
+    /// Returns the per-request timeout override, if any.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
     /// Set a system prompt template (enables `/api/chat` mode on Ollama).
     pub fn with_system(mut self, template: impl Into<String>) -> Self {
         self.system_template = Some(template.into());
@@ -140,6 +180,30 @@ impl LlmCall {
     /// Set retry configuration.
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = Some(retry);
+        self
+    }
+
+    /// Set a per-request timeout for this payload's HTTP calls.
+    ///
+    /// When set, each HTTP request to the LLM provider uses this timeout
+    /// instead of the default [`PipelineLimits::request_timeout`](crate::limits::PipelineLimits::request_timeout).
+    /// This allows mixed-latency payloads (e.g., a 5 s classifier and a
+    /// 120 s generator) to coexist on the same [`ExecCtx`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    /// use llm_pipeline::LlmCall;
+    ///
+    /// let fast_call = LlmCall::new("classify", "Classify: {input}")
+    ///     .with_timeout(Duration::from_secs(5));
+    ///
+    /// let slow_call = LlmCall::new("generate", "Write a story about: {input}")
+    ///     .with_timeout(Duration::from_secs(120));
+    /// ```
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -190,6 +254,7 @@ impl LlmCall {
             streaming,
             output_strategy: OutputStrategy::default(),
             retry: None,
+            timeout: None,
         }
     }
 
@@ -222,12 +287,18 @@ impl LlmCall {
     }
 
     /// Build an `LlmRequest` from the current state.
+    ///
+    /// `effective_timeout` is the resolved per-request timeout: either the
+    /// payload-specific override (`self.timeout`) or the context default
+    /// (`ctx.limits.request_timeout`).
     fn build_request(
         &self,
         prompt: &str,
         system: Option<&str>,
         messages: Vec<ChatMessage>,
         stream: bool,
+        effective_timeout: Duration,
+        ctx: &ExecCtx,
     ) -> LlmRequest {
         LlmRequest {
             model: self.model.clone(),
@@ -235,7 +306,322 @@ impl LlmCall {
             prompt: prompt.to_string(),
             messages,
             config: self.config.clone(),
+            constraint: self.config.constraint.clone(),
+            max_tokens_limit: ctx.limits.max_tokens_per_call,
             stream,
+            request_timeout: Some(effective_timeout),
+        }
+    }
+
+    /// Resolve the effective per-request timeout: payload override wins,
+    /// otherwise falls back to context limits.
+    fn effective_timeout(&self, ctx: &ExecCtx) -> Duration {
+        self.timeout.unwrap_or(ctx.limits.request_timeout)
+    }
+
+    fn parser_options(ctx: &ExecCtx) -> ParseOptions {
+        ParseOptions {
+            max_input_bytes: ctx
+                .limits
+                .max_response_bytes
+                .min(ParseOptions::default().max_input_bytes),
+            ..ParseOptions::default()
+        }
+    }
+
+    fn enforce_token_budget(ctx: &ExecCtx, response: &LlmResponse) -> Result<()> {
+        if let (Some(budget), Some(usage)) = (&ctx.token_budget, &response.token_usage) {
+            let used = usage.total_tokens;
+            let limit = budget.load(std::sync::atomic::Ordering::Acquire);
+            loop {
+                if used > limit {
+                    return Err(PipelineError::BudgetExceeded { used, limit });
+                }
+                match budget.compare_exchange(
+                    limit,
+                    limit - used,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => {
+                        if used > actual {
+                            return Err(PipelineError::BudgetExceeded {
+                                used,
+                                limit: actual,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_response_size(ctx: &ExecCtx, size: usize) -> Result<()> {
+        if size > ctx.limits.max_response_bytes {
+            return Err(crate::PipelineError::ResponseTooLarge {
+                size,
+                limit: ctx.limits.max_response_bytes,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Run sequential semantic retries.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_sequential_retries(
+        &self,
+        ctx: &ExecCtx,
+        retry_config: &RetryConfig,
+        prompt: &str,
+        system: Option<String>,
+        output: &mut PayloadOutput,
+        semantic_retries_used: &mut u32,
+        total_transport_retries: &mut u32,
+        total_backoff_total_ms: &mut u64,
+        retry_attempt_id: &mut Option<AttemptId>,
+        retry_trial_id: &mut Option<TrialId>,
+        effective_timeout: Duration,
+    ) -> Result<()> {
+        let attempt_id = AttemptId::generate();
+        *retry_attempt_id = Some(attempt_id.clone());
+
+        let mut messages = vec![ChatMessage {
+            role: backend::Role::User,
+            content: prompt.to_string(),
+        }];
+        let mut temp_offset = 0.0f64;
+        let parser_opts = Self::parser_options(ctx);
+
+        let mut retry_reason = self.check_retry_needed(output, retry_config);
+
+        for attempt in 1..=retry_config.max_retries {
+            ctx.check_cancelled()?;
+
+            let reason = retry_reason.take().unwrap_or_default();
+            let trial_id = TrialId::generate();
+            *retry_trial_id = Some(trial_id.clone());
+
+            emit(
+                &ctx.event_handler,
+                Event::RetryStart {
+                    name: self.name.clone(),
+                    attempt,
+                    reason: reason.clone(),
+                    attempt_id: attempt_id.clone(),
+                    trial_id: trial_id.clone(),
+                },
+            );
+
+            messages.push(ChatMessage {
+                role: backend::Role::Assistant,
+                content: output.raw_response.clone(),
+            });
+            messages.push(ChatMessage {
+                role: backend::Role::User,
+                content: format!(
+                    "Your previous response was invalid: {}. Please try again with the correct format.",
+                    reason
+                ),
+            });
+
+            if retry_config.cool_down {
+                temp_offset += retry_config.cool_down_schedule.decrement_for(attempt);
+            }
+
+            let mut retry_config_clone = self.config.clone();
+            retry_config_clone.temperature =
+                (retry_config_clone.temperature - temp_offset).max(0.0);
+
+            let retry_request = LlmRequest {
+                model: self.model.clone(),
+                system_prompt: system.clone(),
+                prompt: prompt.to_string(),
+                messages: messages.clone(),
+                config: retry_config_clone,
+                constraint: self.config.constraint.clone(),
+                max_tokens_limit: ctx.limits.max_tokens_per_call,
+                stream: false,
+                request_timeout: Some(effective_timeout),
+            };
+
+            let (retry_response, tr, bt) = self.call_backend(ctx, &retry_request).await?;
+            Self::enforce_token_budget(ctx, &retry_response)?;
+            *total_transport_retries += tr;
+            *total_backoff_total_ms += bt;
+            Self::enforce_response_size(ctx, retry_response.text.len())?;
+
+            let retry_response_text = retry_response.text.clone();
+            *semantic_retries_used = attempt;
+            *output = self.build_output(retry_response_text, &parser_opts);
+            Self::apply_response_metadata(output, &retry_response);
+
+            if let Some(ref mut diag) = output.diagnostics {
+                diag.retry_attempts = *semantic_retries_used;
+                diag.transport_retries = *total_transport_retries;
+                diag.backoff_total_ms = *total_backoff_total_ms;
+                diag.attempt_id = Some(attempt_id.clone());
+                diag.trial_id = Some(trial_id);
+            }
+
+            retry_reason = self.check_retry_needed(output, retry_config);
+
+            emit(
+                &ctx.event_handler,
+                Event::RetryEnd {
+                    name: self.name.clone(),
+                    attempts: attempt,
+                    success: retry_reason.is_none(),
+                    attempt_id: attempt_id.clone(),
+                },
+            );
+
+            if retry_reason.is_none() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run best-of-N concurrent semantic retries.
+    ///
+    /// Returns `Ok(true)` if all attempts failed and the caller should follow
+    /// `BestOfNExhaustion`; returns `Ok(false)` if a successful parse was found.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_best_of_n(
+        &self,
+        ctx: &ExecCtx,
+        retry_config: &RetryConfig,
+        n: u32,
+        temperatures: Vec<f64>,
+        prompt: &str,
+        system: Option<String>,
+        effective_timeout: Duration,
+        output: &mut PayloadOutput,
+        semantic_retries_used: &mut u32,
+        total_transport_retries: &mut u32,
+        total_backoff_total_ms: &mut u64,
+        retry_attempt_id: &mut Option<AttemptId>,
+        retry_trial_id: &mut Option<TrialId>,
+    ) -> Result<bool> {
+        let attempt_id = AttemptId::generate();
+        *retry_attempt_id = Some(attempt_id.clone());
+        let parser_opts = Self::parser_options(ctx);
+
+        let base_messages = vec![ChatMessage {
+            role: backend::Role::User,
+            content: prompt.to_string(),
+        }];
+
+        let count = n as usize;
+        let mut tasks = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let temperature = temperatures.get(i).copied().unwrap_or_else(|| {
+                retry_config
+                    .cool_down_schedule
+                    .apply(self.config.temperature, i as u32 + 1)
+            });
+            let mut cfg = self.config.clone();
+            cfg.temperature = temperature.max(0.0);
+
+            let request = LlmRequest {
+                model: self.model.clone(),
+                system_prompt: system.clone(),
+                prompt: prompt.to_string(),
+                messages: base_messages.clone(),
+                config: cfg,
+                constraint: self.config.constraint.clone(),
+                max_tokens_limit: ctx.limits.max_tokens_per_call,
+                stream: false,
+                request_timeout: Some(effective_timeout),
+            };
+
+            let this = self.clone();
+            let ctx_ref = ctx.clone();
+            let request_clone = request;
+            tasks.push(async move {
+                let trial_id = TrialId::generate();
+                let result = this.call_backend(&ctx_ref, &request_clone).await;
+                (i, trial_id, result)
+            });
+        }
+
+        let results = join_all(tasks).await;
+        let mut errors: Vec<String> = Vec::new();
+
+        for (i, trial_id, result) in results {
+            match result {
+                Ok((response, tr, bt)) => {
+                    if let Err(e) = Self::enforce_token_budget(ctx, &response) {
+                        errors.push(format!("attempt {}: budget exceeded - {}", i + 1, e));
+                        continue;
+                    }
+                    *total_transport_retries += tr;
+                    *total_backoff_total_ms += bt;
+                    if let Err(e) = Self::enforce_response_size(ctx, response.text.len()) {
+                        errors.push(format!("attempt {}: response too large - {}", i + 1, e));
+                        continue;
+                    }
+
+                    let candidate = self.build_output(response.text.clone(), &parser_opts);
+                    if self.check_retry_needed(&candidate, retry_config).is_none() {
+                        *semantic_retries_used = i as u32 + 1;
+                        *retry_trial_id = Some(trial_id);
+                        *output = candidate;
+                        Self::apply_response_metadata(output, &response);
+                        if let Some(ref mut diag) = output.diagnostics {
+                            diag.retry_attempts = *semantic_retries_used;
+                            diag.transport_retries = *total_transport_retries;
+                            diag.backoff_total_ms = *total_backoff_total_ms;
+                            diag.attempt_id = Some(attempt_id.clone());
+                            diag.trial_id = retry_trial_id.clone();
+                        }
+                        return Ok(false);
+                    } else {
+                        errors.push(format!("attempt {}: parse/validation failed", i + 1));
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("attempt {}: backend error - {}", i + 1, e));
+                }
+            }
+        }
+
+        // No candidate succeeded.
+        emit(
+            &ctx.event_handler,
+            Event::RetryEnd {
+                name: self.name.clone(),
+                attempts: n,
+                success: false,
+                attempt_id,
+            },
+        );
+
+        Ok(true)
+    }
+
+    async fn wait_for_stream_idle(
+        idle_timeout: std::time::Duration,
+        mut rx: watch::Receiver<StdInstant>,
+    ) {
+        loop {
+            let deadline = *rx.borrow() + idle_timeout;
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+            tokio::pin!(sleep);
+
+            tokio::select! {
+                _ = &mut sleep => return,
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -288,14 +674,16 @@ impl LlmCall {
         ctx: &ExecCtx,
         request: &LlmRequest,
     ) -> Result<(LlmResponse, u32, u64)> {
-        let mut transport_retries: u32 = 0;
-        let mut backoff_total_ms: u64 = 0;
+        let retry_stats = Arc::new(Mutex::new((0u32, 0u64)));
         let retry_name = self.name.clone();
         let retry_event_handler = ctx.event_handler.clone();
 
+        let retry_stats_for_cb = Arc::clone(&retry_stats);
         let mut on_retry = |attempt: u32, delay: std::time::Duration, reason: &str| {
-            transport_retries = attempt;
-            backoff_total_ms += delay.as_millis() as u64;
+            if let Ok(mut stats) = retry_stats_for_cb.lock() {
+                stats.0 = attempt;
+                stats.1 += delay.as_millis() as u64;
+            }
             emit(
                 &retry_event_handler,
                 Event::TransportRetry {
@@ -309,7 +697,20 @@ impl LlmCall {
 
         let name = self.name.clone();
         let event_handler = ctx.event_handler.clone();
+        let (idle_tx, idle_rx) = watch::channel(StdInstant::now());
+        let (limit_tx, mut limit_rx) = mpsc::unbounded_channel();
+        let max_response_bytes = ctx.limits.max_response_bytes;
+        let mut streamed_bytes = 0usize;
+
         let mut on_token = move |token: String| {
+            streamed_bytes += token.len();
+            let _ = idle_tx.send(StdInstant::now());
+
+            if streamed_bytes > max_response_bytes {
+                let _ = limit_tx.send(streamed_bytes);
+                return;
+            }
+
             emit(
                 &event_handler,
                 Event::Token {
@@ -319,7 +720,8 @@ impl LlmCall {
             );
         };
 
-        let response = backend::with_backoff_streaming(
+        let idle_timeout = ctx.limits.stream_idle_timeout;
+        let backend_call = backend::with_backoff_streaming(
             &ctx.backend,
             &ctx.client,
             &ctx.base_url,
@@ -330,8 +732,30 @@ impl LlmCall {
                 on_retry: Some(&mut on_retry),
                 on_token: &mut on_token,
             },
-        )
-        .await?;
+        );
+        tokio::pin!(backend_call);
+
+        let idle_watch = Self::wait_for_stream_idle(idle_timeout, idle_rx);
+        tokio::pin!(idle_watch);
+
+        let response = tokio::select! {
+            response = &mut backend_call => response?,
+            Some(size) = limit_rx.recv() => {
+                return Err(crate::PipelineError::ResponseTooLarge {
+                    size,
+                    limit: max_response_bytes,
+                });
+            }
+            _ = &mut idle_watch => {
+                return Err(crate::PipelineError::StreamIdle {
+                    idle_ms: idle_timeout.as_millis() as u64,
+                    limit_ms: idle_timeout.as_millis() as u64,
+                });
+            }
+        };
+
+        let (transport_retries, backoff_total_ms) =
+            retry_stats.lock().map(|stats| *stats).unwrap_or((0, 0));
 
         Ok((response, transport_retries, backoff_total_ms))
     }
@@ -359,11 +783,65 @@ impl LlmCall {
         None
     }
 
+    /// Check whether a backend can satisfy the request's structured-generation constraint.
+    fn preflight_constraint(ctx: &ExecCtx, request: &LlmRequest) -> Result<()> {
+        let backend_name = ctx.backend.name();
+        match &request.constraint {
+            GenerationConstraint::None => Ok(()),
+            GenerationConstraint::JsonSchema(_) => {
+                if ctx.backend.supports_json_schema() {
+                    Ok(())
+                } else {
+                    Err(PipelineError::UnsupportedConstraint {
+                        backend: backend_name.to_string(),
+                        constraint: "JsonSchema".to_string(),
+                    })
+                }
+            }
+            GenerationConstraint::Grammar(_) => {
+                if ctx.backend.supports_grammar() {
+                    Ok(())
+                } else {
+                    Err(PipelineError::UnsupportedConstraint {
+                        backend: backend_name.to_string(),
+                        constraint: "Grammar".to_string(),
+                    })
+                }
+            }
+            GenerationConstraint::Regex(_) => {
+                if ctx.backend.supports_regex() {
+                    Ok(())
+                } else {
+                    Err(PipelineError::UnsupportedConstraint {
+                        backend: backend_name.to_string(),
+                        constraint: "Regex".to_string(),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Apply telemetry and provider metadata from an `LlmResponse` to a `PayloadOutput`.
+    fn apply_response_metadata(output: &mut PayloadOutput, response: &LlmResponse) {
+        output.ttft_ms = response.ttft_ms;
+        output.token_usage = response.token_usage.clone();
+        output.finish_reason = response.finish_reason.clone();
+        output.cache_hit = response.cache_hit;
+        if let Some(raw) = response.provider_meta.raw.as_ref() {
+            if let Some(model) = raw.get("model").and_then(|v| v.as_str()) {
+                if output.model.is_none() {
+                    output.model = Some(model.to_string());
+                }
+            }
+        }
+    }
+
     /// Build a `PayloadOutput` from raw LLM text using the configured `OutputStrategy`.
     ///
     /// Per CLAUDE.md: `build_output` MUST always return `Ok(PayloadOutput)`.
     /// Parse failures go into `diagnostics.parse_error`, not `Err`.
-    fn build_output(&self, raw_text: String) -> PayloadOutput {
+    fn build_output(&self, raw_text: String, parser_opts: &ParseOptions) -> PayloadOutput {
+        let response_bytes = raw_text.len();
         let (thinking, cleaned) = parsing::extract_thinking(&raw_text);
 
         let mut diag = ParseDiagnostics::default();
@@ -375,8 +853,11 @@ impl LlmCall {
             }
             OutputStrategy::Json => {
                 diag.strategy = Some("json");
-                match output_parser::parse_json_value(&cleaned) {
-                    Ok(v) => v,
+                match output_parser::parse_json_value_with_trace(&cleaned, parser_opts) {
+                    Ok((v, trace)) => {
+                        diag.apply_trace(trace);
+                        v
+                    }
                     Err(e) => {
                         diag.parse_error = Some(e.to_string());
                         // Fallback: try lossy parse
@@ -386,8 +867,11 @@ impl LlmCall {
             }
             OutputStrategy::StringList => {
                 diag.strategy = Some("string_list");
-                match output_parser::parse_string_list_raw(&cleaned) {
-                    Ok(items) => Value::Array(items.into_iter().map(Value::String).collect()),
+                match output_parser::parse_string_list_with_trace(&cleaned, parser_opts) {
+                    Ok((items, trace)) => {
+                        diag.apply_trace(trace);
+                        Value::Array(items.into_iter().map(Value::String).collect())
+                    }
                     Err(e) => {
                         diag.parse_error = Some(e.to_string());
                         Value::String(cleaned.clone())
@@ -396,8 +880,11 @@ impl LlmCall {
             }
             OutputStrategy::XmlTag(tag) => {
                 diag.strategy = Some("xml_tag");
-                match output_parser::parse_xml_tag(&cleaned, tag) {
-                    Ok(content) => Value::String(content),
+                match output_parser::parse_xml_tag_with_trace(&cleaned, tag, parser_opts) {
+                    Ok((content, trace)) => {
+                        diag.apply_trace(trace);
+                        Value::String(content)
+                    }
                     Err(e) => {
                         diag.parse_error = Some(e.to_string());
                         Value::String(cleaned.clone())
@@ -407,8 +894,11 @@ impl LlmCall {
             OutputStrategy::Choice(choices) => {
                 diag.strategy = Some("choice");
                 let choice_refs: Vec<&str> = choices.iter().map(|s| s.as_str()).collect();
-                match output_parser::parse_choice(&cleaned, &choice_refs) {
-                    Ok(matched) => Value::String(matched.to_string()),
+                match output_parser::parse_choice_with_trace(&cleaned, &choice_refs, parser_opts) {
+                    Ok((matched, trace)) => {
+                        diag.apply_trace(trace);
+                        Value::String(matched.to_string())
+                    }
                     Err(e) => {
                         diag.parse_error = Some(e.to_string());
                         Value::String(cleaned.clone())
@@ -417,8 +907,11 @@ impl LlmCall {
             }
             OutputStrategy::Number => {
                 diag.strategy = Some("number");
-                match output_parser::parse_number::<f64>(&cleaned) {
-                    Ok(n) => json!(n),
+                match output_parser::parse_number_with_trace::<f64>(&cleaned, parser_opts) {
+                    Ok((n, trace)) => {
+                        diag.apply_trace(trace);
+                        json!(n)
+                    }
                     Err(e) => {
                         diag.parse_error = Some(e.to_string());
                         Value::String(cleaned.clone())
@@ -427,8 +920,16 @@ impl LlmCall {
             }
             OutputStrategy::NumberInRange(min, max) => {
                 diag.strategy = Some("number_in_range");
-                match output_parser::parse_number_in_range::<f64>(&cleaned, *min, *max) {
-                    Ok(n) => json!(n),
+                match output_parser::parse_number_in_range_with_trace::<f64>(
+                    &cleaned,
+                    *min,
+                    *max,
+                    parser_opts,
+                ) {
+                    Ok((n, trace)) => {
+                        diag.apply_trace(trace);
+                        json!(n)
+                    }
                     Err(e) => {
                         diag.parse_error = Some(e.to_string());
                         Value::String(cleaned.clone())
@@ -437,8 +938,11 @@ impl LlmCall {
             }
             OutputStrategy::Text => {
                 diag.strategy = Some("text");
-                match output_parser::parse_text(&cleaned) {
-                    Ok(text) => Value::String(text),
+                match output_parser::parse_text_with_trace(&cleaned, parser_opts) {
+                    Ok((text, trace)) => {
+                        diag.apply_trace(trace);
+                        Value::String(text)
+                    }
                     Err(e) => {
                         diag.parse_error = Some(e.to_string());
                         Value::String(cleaned.clone())
@@ -457,27 +961,27 @@ impl LlmCall {
             }
         };
 
-        // Check if repair was applied (for Json strategy, the output_parser
-        // internally tries repair — we can detect this by checking if the
-        // parse succeeded on repaired input)
-        if diag.parse_error.is_none() && matches!(self.output_strategy, OutputStrategy::Json) {
-            // If direct parse of cleaned text fails but output_parser succeeded,
-            // it means repair was applied
-            if serde_json::from_str::<Value>(&cleaned).is_err() {
-                diag.repaired = true;
-            }
-        }
-
         PayloadOutput {
             value,
             raw_response: raw_text,
             thinking,
             model: Some(self.model.clone()),
+            ttft_ms: None,
+            token_usage: None,
+            finish_reason: None,
+            cache_hit: false,
             diagnostics: Some(diag),
+            trace_id: None,  // Set by invoke()
+            trace_ctx: None, // Set by invoke()
+            transport_retries_used: 0,
+            semantic_retries_used: 0,
+            response_bytes,
+            wall_time_ms: 0,
         }
     }
 }
 
+#[allow(deprecated)]
 impl Payload for LlmCall {
     fn kind(&self) -> &'static str {
         "llm-call"
@@ -489,6 +993,7 @@ impl Payload for LlmCall {
 
     fn invoke<'a>(&'a self, ctx: &'a ExecCtx, input: Value) -> BoxFut<'a, Result<PayloadOutput>> {
         Box::pin(async move {
+            let start = std::time::Instant::now();
             ctx.check_cancelled()?;
 
             emit(
@@ -499,33 +1004,175 @@ impl Payload for LlmCall {
                 },
             );
 
-            let input_str = Self::input_to_string(&input);
-            let prompt = Self::render_prompt(&self.prompt_template, &input_str, &ctx.vars);
-            let system = self
-                .system_template
-                .as_ref()
-                .map(|t| Self::render_system(t, &ctx.vars));
+            let execution = async {
+                let parser_opts = Self::parser_options(ctx);
+                let input_str = Self::input_to_string(&input);
+                let prompt = Self::render_prompt(&self.prompt_template, &input_str, &ctx.vars);
+                let system = self
+                    .system_template
+                    .as_ref()
+                    .map(|t| Self::render_system(t, &ctx.vars));
 
-            // --- Initial call ---
-            let request =
-                self.build_request(&prompt, system.as_deref(), Vec::new(), self.streaming);
+                let effective_timeout = self.effective_timeout(ctx);
+                let request = self.build_request(
+                    &prompt,
+                    system.as_deref(),
+                    Vec::new(),
+                    self.streaming,
+                    effective_timeout,
+                    ctx,
+                );
 
-            let result = if self.streaming {
-                self.call_backend_streaming(ctx, &request).await
-            } else {
-                self.call_backend(ctx, &request).await
+                // Preflight: reject constraints the backend cannot satisfy.
+                Self::preflight_constraint(ctx, &request)?;
+
+                let result = if self.streaming {
+                    self.call_backend_streaming(ctx, &request).await
+                } else {
+                    self.call_backend(ctx, &request).await
+                };
+
+                let (response, mut total_transport_retries, mut total_backoff_total_ms) = result?;
+                Self::enforce_token_budget(ctx, &response)?;
+                Self::enforce_response_size(ctx, response.text.len())?;
+
+                let mut semantic_retries_used = 0u32;
+                let response_text = response.text.clone();
+                let mut output = self.build_output(response_text, &parser_opts);
+                Self::apply_response_metadata(&mut output, &response);
+                if let Some(ref mut diag) = output.diagnostics {
+                    diag.transport_retries = total_transport_retries;
+                    diag.backoff_total_ms = total_backoff_total_ms;
+                }
+
+                // Structured retry identifiers: one AttemptId per logical retry
+                // family, one TrialId per concrete execution within that family.
+                let mut retry_attempt_id: Option<AttemptId> = None;
+                let mut retry_trial_id: Option<TrialId> = None;
+
+                if let Some(ref retry_config) = self.retry {
+                    let retry_reason = self.check_retry_needed(&output, retry_config);
+
+                    if retry_reason.is_some() {
+                        match retry_config.strategy {
+                            crate::retry::RetryStrategy::Sequential => {
+                                self.run_sequential_retries(
+                                    ctx,
+                                    retry_config,
+                                    &prompt,
+                                    system.clone(),
+                                    &mut output,
+                                    &mut semantic_retries_used,
+                                    &mut total_transport_retries,
+                                    &mut total_backoff_total_ms,
+                                    &mut retry_attempt_id,
+                                    &mut retry_trial_id,
+                                    effective_timeout,
+                                )
+                                .await?;
+                            }
+                            crate::retry::RetryStrategy::BestOfN {
+                                n,
+                                ref temperatures,
+                            } => {
+                                let exhausted = self
+                                    .run_best_of_n(
+                                        ctx,
+                                        retry_config,
+                                        n,
+                                        temperatures.clone(),
+                                        &prompt,
+                                        system.clone(),
+                                        effective_timeout,
+                                        &mut output,
+                                        &mut semantic_retries_used,
+                                        &mut total_transport_retries,
+                                        &mut total_backoff_total_ms,
+                                        &mut retry_attempt_id,
+                                        &mut retry_trial_id,
+                                    )
+                                    .await?;
+
+                                if exhausted {
+                                    match retry_config.best_of_n_exhaustion {
+                                        crate::retry::BestOfNExhaustion::SequentialFallback => {
+                                            self.run_sequential_retries(
+                                                ctx,
+                                                retry_config,
+                                                &prompt,
+                                                system.clone(),
+                                                &mut output,
+                                                &mut semantic_retries_used,
+                                                &mut total_transport_retries,
+                                                &mut total_backoff_total_ms,
+                                                &mut retry_attempt_id,
+                                                &mut retry_trial_id,
+                                                effective_timeout,
+                                            )
+                                            .await?;
+                                        }
+                                        crate::retry::BestOfNExhaustion::ReturnError => {
+                                            return Err(PipelineError::Other(format!(
+                                                "BestOfN exhausted all {} attempts without a valid parse",
+                                                n
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref mut diag) = output.diagnostics {
+                    diag.retry_attempts = semantic_retries_used;
+                    diag.transport_retries = total_transport_retries;
+                    diag.backoff_total_ms = total_backoff_total_ms;
+                    // Persist final retry identifiers on diagnostics
+                    if retry_attempt_id.is_some() {
+                        diag.attempt_id = retry_attempt_id;
+                        diag.trial_id = retry_trial_id;
+                    }
+                }
+
+                output.trace_id = Some(ctx.trace_id.clone());
+                output.trace_ctx = Some(ctx.trace_ctx.clone());
+                output.transport_retries_used = total_transport_retries;
+                output.semantic_retries_used = semantic_retries_used;
+                output.wall_time_ms = start.elapsed().as_millis() as u64;
+
+                // Emit cost update if a cost model is configured and usage was reported.
+                if let (Some(cost_model), Some(usage)) =
+                    (ctx.cost_model, output.token_usage.clone())
+                {
+                    let estimated_cost = cost_model.estimate(&usage, output.cache_hit);
+                    emit(
+                        &ctx.event_handler,
+                        Event::CostUpdate {
+                            name: self.name.clone(),
+                            estimated_cost,
+                            currency: "USD".to_string(),
+                            token_usage: usage,
+                        },
+                    );
+                }
+
+                Ok(output)
             };
 
-            let mut output = match result {
-                Ok((response, transport_retries, backoff_total_ms)) => {
-                    let mut out = self.build_output(response.text);
-                    if let Some(ref mut diag) = out.diagnostics {
-                        diag.transport_retries = transport_retries;
-                        diag.backoff_total_ms = backoff_total_ms;
-                    }
-                    out
+            let result = tokio::time::timeout(ctx.limits.request_timeout, execution).await;
+            match result {
+                Ok(Ok(output)) => {
+                    emit(
+                        &ctx.event_handler,
+                        Event::PayloadEnd {
+                            name: self.name.clone(),
+                            ok: true,
+                        },
+                    );
+                    Ok(output)
                 }
-                Err(e) => {
+                Ok(Err(err)) => {
                     emit(
                         &ctx.event_handler,
                         Event::PayloadEnd {
@@ -533,493 +1180,27 @@ impl Payload for LlmCall {
                             ok: false,
                         },
                     );
-                    return Err(e);
+                    Err(err)
                 }
-            };
-
-            // --- Retry loop ---
-            if let Some(ref retry_config) = self.retry {
-                // Check if initial output needs retry
-                let mut retry_reason = self.check_retry_needed(&output, retry_config);
-
-                if retry_reason.is_some() {
-                    let mut messages = vec![ChatMessage {
-                        role: backend::Role::User,
-                        content: prompt.clone(),
-                    }];
-                    let mut temp_offset = 0.0f64;
-
-                    for attempt in 1..=retry_config.max_retries {
-                        ctx.check_cancelled()?;
-
-                        let reason = retry_reason.take().unwrap_or_default();
-
-                        emit(
-                            &ctx.event_handler,
-                            Event::RetryStart {
-                                name: self.name.clone(),
-                                attempt,
-                                reason: reason.clone(),
-                            },
-                        );
-
-                        // Build correction messages
-                        messages.push(ChatMessage {
-                            role: backend::Role::Assistant,
-                            content: output.raw_response.clone(),
-                        });
-                        messages.push(ChatMessage {
-                            role: backend::Role::User,
-                            content: format!(
-                                "Your previous response was invalid: {}. Please try again with the correct format.",
-                                reason
-                            ),
-                        });
-
-                        // Cool down temperature
-                        if retry_config.cool_down {
-                            temp_offset += 0.2;
-                        }
-
-                        let mut retry_config_clone = self.config.clone();
-                        retry_config_clone.temperature =
-                            (retry_config_clone.temperature - temp_offset).max(0.0);
-
-                        let retry_request = LlmRequest {
-                            model: self.model.clone(),
-                            system_prompt: system.clone(),
-                            prompt: prompt.clone(),
-                            messages: messages.clone(),
-                            config: retry_config_clone,
-                            stream: false, // retries always non-streaming
-                        };
-
-                        match self.call_backend(ctx, &retry_request).await {
-                            Ok((response, tr, bt)) => {
-                                output = self.build_output(response.text);
-                                if let Some(ref mut diag) = output.diagnostics {
-                                    diag.retry_attempts = attempt;
-                                    diag.transport_retries = tr;
-                                    diag.backoff_total_ms = bt;
-                                }
-                            }
-                            Err(e) => {
-                                emit(
-                                    &ctx.event_handler,
-                                    Event::RetryEnd {
-                                        name: self.name.clone(),
-                                        attempts: attempt,
-                                        success: false,
-                                    },
-                                );
-                                emit(
-                                    &ctx.event_handler,
-                                    Event::PayloadEnd {
-                                        name: self.name.clone(),
-                                        ok: false,
-                                    },
-                                );
-                                return Err(e);
-                            }
-                        }
-
-                        // Check if this retry succeeded
-                        retry_reason = self.check_retry_needed(&output, retry_config);
-
-                        if retry_reason.is_none() {
-                            // Success!
-                            emit(
-                                &ctx.event_handler,
-                                Event::RetryEnd {
-                                    name: self.name.clone(),
-                                    attempts: attempt,
-                                    success: true,
-                                },
-                            );
-                            break;
-                        }
-
-                        if attempt == retry_config.max_retries {
-                            // Exhausted — return best effort
-                            if let Some(ref mut diag) = output.diagnostics {
-                                diag.retry_attempts = attempt;
-                            }
-                            emit(
-                                &ctx.event_handler,
-                                Event::RetryEnd {
-                                    name: self.name.clone(),
-                                    attempts: attempt,
-                                    success: false,
-                                },
-                            );
-                        }
-                    }
+                Err(_) => {
+                    emit(
+                        &ctx.event_handler,
+                        Event::PayloadEnd {
+                            name: self.name.clone(),
+                            ok: false,
+                        },
+                    );
+                    Err(crate::PipelineError::Timeout {
+                        elapsed_ms: ctx.limits.request_timeout.as_millis() as u64,
+                        limit_ms: ctx.limits.request_timeout.as_millis() as u64,
+                    })
                 }
             }
-
-            emit(
-                &ctx.event_handler,
-                Event::PayloadEnd {
-                    name: self.name.clone(),
-                    ok: true,
-                },
-            );
-
-            Ok(output)
         })
     }
 }
 
+#[allow(deprecated)]
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::Role;
-
-    #[test]
-    fn test_build_output_lossy_backward_compat() {
-        let call = LlmCall::new("test", "prompt");
-        let output = call.build_output(r#"{"key": "value"}"#.into());
-        assert!(output.value.is_object());
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-        assert_eq!(output.diagnostics.as_ref().unwrap().strategy, Some("lossy"));
-    }
-
-    #[test]
-    fn test_build_output_json_strategy_succeeds() {
-        let call = LlmCall::new("test", "prompt").expecting_json();
-        let output = call.build_output(r#"{"key": "value"}"#.into());
-        assert!(output.value.is_object());
-        assert_eq!(output.value["key"], "value");
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-    }
-
-    #[test]
-    fn test_build_output_json_strategy_repairs() {
-        let call = LlmCall::new("test", "prompt").expecting_json();
-        // Single quotes and trailing comma — repairable
-        let output = call.build_output("{'key': 'value',}".into());
-        assert!(output.value.is_object());
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-        assert!(output.diagnostics.as_ref().unwrap().repaired);
-    }
-
-    #[test]
-    fn test_build_output_json_strategy_fails() {
-        let call = LlmCall::new("test", "prompt").expecting_json();
-        let output = call.build_output("not json at all".into());
-        assert!(output.diagnostics.as_ref().unwrap().parse_error.is_some());
-        // Should still return a Value (fallback to lossy)
-        assert!(output.value.is_string());
-    }
-
-    #[test]
-    fn test_build_output_string_list_strategy() {
-        let call = LlmCall::new("test", "prompt").expecting_list();
-        let output = call.build_output("[\"apple\", \"banana\", \"cherry\"]".into());
-        assert!(output.value.is_array());
-        let arr = output.value.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-    }
-
-    #[test]
-    fn test_build_output_xml_tag_strategy() {
-        let call = LlmCall::new("test", "prompt")
-            .with_output_strategy(OutputStrategy::XmlTag("answer".into()));
-        let output = call.build_output("<answer>42</answer>".into());
-        assert_eq!(output.value, Value::String("42".into()));
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-    }
-
-    #[test]
-    fn test_build_output_choice_strategy() {
-        let call = LlmCall::new("test", "prompt").expecting_choice(vec![
-            "yes".into(),
-            "no".into(),
-            "maybe".into(),
-        ]);
-        let output = call.build_output("I think the answer is yes.".into());
-        assert_eq!(output.value, Value::String("yes".into()));
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-    }
-
-    #[test]
-    fn test_build_output_number_strategy() {
-        let call = LlmCall::new("test", "prompt").expecting_number();
-        let output = call.build_output("Score: 8.5".into());
-        let n = output.value.as_f64().unwrap();
-        assert!((n - 8.5).abs() < f64::EPSILON);
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-    }
-
-    #[test]
-    fn test_build_output_number_in_range_rejects() {
-        let call = LlmCall::new("test", "prompt").expecting_number_in_range(0.0, 5.0);
-        let output = call.build_output("Score: 8.5".into());
-        // Should fail: 8.5 > 5.0
-        assert!(output.diagnostics.as_ref().unwrap().parse_error.is_some());
-    }
-
-    #[test]
-    fn test_build_output_text_strategy() {
-        let call = LlmCall::new("test", "prompt").expecting_text();
-        let output = call.build_output("Sure! Here's the answer: The sky is blue.".into());
-        let text = output.value.as_str().unwrap();
-        // parse_text strips "Sure!" and "Here's..." prefixes
-        assert!(!text.starts_with("Sure!"));
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-    }
-
-    #[test]
-    fn test_build_output_custom_strategy() {
-        let call = LlmCall::new("test", "prompt").with_output_strategy(OutputStrategy::Custom(
-            std::sync::Arc::new(|raw: &str| {
-                let upper = raw.to_uppercase();
-                Ok(Value::String(upper))
-            }),
-        ));
-        let output = call.build_output("hello world".into());
-        assert_eq!(output.value, Value::String("HELLO WORLD".into()));
-        assert!(output.diagnostics.as_ref().unwrap().ok());
-    }
-
-    #[test]
-    fn test_diagnostics_attached_to_output() {
-        let call = LlmCall::new("test", "prompt").expecting_json();
-        let output = call.build_output(r#"{"a": 1}"#.into());
-        let diag = output.diagnostics.as_ref().unwrap();
-        assert_eq!(diag.strategy, Some("json"));
-        assert!(diag.ok());
-        assert!(!diag.repaired);
-        assert_eq!(diag.retry_attempts, 0);
-    }
-
-    #[test]
-    fn test_build_output_with_thinking() {
-        let call = LlmCall::new("test", "prompt").expecting_json();
-        let input = "<think>Let me think about this...</think>{\"result\": 42}";
-        let output = call.build_output(input.into());
-        assert_eq!(output.thinking, Some("Let me think about this...".into()));
-        assert_eq!(output.value["result"], 42);
-    }
-
-    #[test]
-    fn test_backend_default_is_ollama() {
-        let ctx = ExecCtx::builder("http://localhost:11434").build();
-        assert_eq!(ctx.backend.name(), "ollama");
-    }
-
-    #[cfg(feature = "openai")]
-    #[test]
-    fn test_exec_ctx_openai_builder() {
-        let ctx = ExecCtx::builder("https://api.openai.com")
-            .openai_with_key("sk-test")
-            .build();
-        assert_eq!(ctx.backend.name(), "openai");
-    }
-
-    #[test]
-    fn test_build_request() {
-        let call = LlmCall::new("test", "Summarize: {input}")
-            .with_model("gpt-4o")
-            .with_config(LlmConfig::default().with_json_mode(true));
-
-        let request = call.build_request(
-            "Tell me about Rust",
-            Some("You are helpful"),
-            Vec::new(),
-            false,
-        );
-
-        assert_eq!(request.model, "gpt-4o");
-        assert_eq!(request.prompt, "Tell me about Rust");
-        assert_eq!(request.system_prompt.as_deref(), Some("You are helpful"));
-        assert!(request.config.json_mode);
-        assert!(!request.stream);
-    }
-
-    #[test]
-    fn test_build_request_with_messages() {
-        let call = LlmCall::new("test", "prompt");
-        let messages = vec![
-            ChatMessage {
-                role: Role::User,
-                content: "What is 2+2?".into(),
-            },
-            ChatMessage {
-                role: Role::Assistant,
-                content: "4".into(),
-            },
-        ];
-        let request = call.build_request("Follow up", None, messages, false);
-        assert_eq!(request.messages.len(), 2);
-    }
-
-    // --- Retry tests (unit-level, testing check_retry_needed and retry config) ---
-
-    #[test]
-    fn test_retry_not_triggered_on_success() {
-        let call = LlmCall::new("test", "prompt")
-            .expecting_json()
-            .with_retry(RetryConfig::new(2));
-
-        let output = call.build_output(r#"{"key": "value"}"#.into());
-        let retry_config = call.retry.as_ref().unwrap();
-        assert!(call.check_retry_needed(&output, retry_config).is_none());
-    }
-
-    #[test]
-    fn test_retry_triggered_on_parse_failure() {
-        let call = LlmCall::new("test", "prompt")
-            .expecting_json()
-            .with_retry(RetryConfig::new(2));
-
-        let output = call.build_output("not json".into());
-        let retry_config = call.retry.as_ref().unwrap();
-        let reason = call.check_retry_needed(&output, retry_config);
-        assert!(reason.is_some());
-    }
-
-    #[test]
-    fn test_retry_triggered_on_semantic_failure() {
-        let call = LlmCall::new("test", "prompt")
-            .expecting_json()
-            .with_retry(RetryConfig::new(2).requiring_keys(&["title", "year"]));
-
-        // Valid JSON but missing required keys
-        let output = call.build_output(r#"{"title": "Matrix"}"#.into());
-        let retry_config = call.retry.as_ref().unwrap();
-        let reason = call.check_retry_needed(&output, retry_config);
-        assert!(reason.is_some());
-        assert!(reason.unwrap().contains("year"));
-    }
-
-    #[test]
-    fn test_retry_requiring_keys_passes() {
-        let call = LlmCall::new("test", "prompt")
-            .expecting_json()
-            .with_retry(RetryConfig::new(2).requiring_keys(&["title", "year"]));
-
-        let output = call.build_output(r#"{"title": "Matrix", "year": 1999}"#.into());
-        let retry_config = call.retry.as_ref().unwrap();
-        assert!(call.check_retry_needed(&output, retry_config).is_none());
-    }
-
-    #[test]
-    fn test_retry_cool_down_reduces_temperature() {
-        let config = LlmConfig::default().with_temperature(0.7);
-        let call = LlmCall::new("test", "prompt")
-            .with_config(config)
-            .with_retry(RetryConfig::new(3));
-
-        // Verify cool_down is true by default
-        assert!(call.retry.as_ref().unwrap().cool_down);
-
-        // After 2 retries at 0.2 per retry: 0.7 - 0.4 = 0.3
-        let adjusted = (0.7 - 0.4f64).max(0.0);
-        assert!((adjusted - 0.3).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_retry_no_cool_down() {
-        let call = LlmCall::new("test", "prompt").with_retry(RetryConfig::new(3).no_cool_down());
-
-        assert!(!call.retry.as_ref().unwrap().cool_down);
-    }
-
-    #[test]
-    fn test_choice_strategy_with_retry_detects_failure() {
-        let call = LlmCall::new("test", "prompt")
-            .expecting_choice(vec!["approve".into(), "reject".into(), "defer".into()])
-            .with_retry(RetryConfig::new(2));
-
-        // Bad response - no valid choice found
-        let output = call.build_output("I think we should consider all options carefully.".into());
-        let retry_config = call.retry.as_ref().unwrap();
-        let reason = call.check_retry_needed(&output, retry_config);
-        assert!(reason.is_some());
-    }
-
-    #[test]
-    fn test_choice_strategy_succeeds() {
-        let call = LlmCall::new("test", "prompt")
-            .expecting_choice(vec!["approve".into(), "reject".into(), "defer".into()])
-            .with_retry(RetryConfig::new(2));
-
-        let output = call.build_output("I would approve this request.".into());
-        let retry_config = call.retry.as_ref().unwrap();
-        assert!(call.check_retry_needed(&output, retry_config).is_none());
-        assert_eq!(output.value, Value::String("approve".into()));
-    }
-
-    #[test]
-    fn test_number_in_range_with_retry_detects_failure() {
-        let call = LlmCall::new("test", "prompt")
-            .expecting_number_in_range(1.0, 10.0)
-            .with_retry(RetryConfig::new(2));
-
-        let output = call.build_output("Score: 15".into());
-        let retry_config = call.retry.as_ref().unwrap();
-        let reason = call.check_retry_needed(&output, retry_config);
-        assert!(reason.is_some());
-    }
-
-    #[test]
-    fn test_custom_validator_with_retry() {
-        let call = LlmCall::new("test", "prompt").expecting_json().with_retry(
-            RetryConfig::new(2).with_validator(|_raw, value| {
-                let score = value
-                    .get("score")
-                    .and_then(|v| v.as_f64())
-                    .ok_or("missing score")?;
-                if !(0.0..=1.0).contains(&score) {
-                    return Err(format!("score {} outside 0.0-1.0", score));
-                }
-                Ok(())
-            }),
-        );
-
-        // Valid JSON with out-of-range score
-        let output = call.build_output(r#"{"score": 1.5}"#.into());
-        let retry_config = call.retry.as_ref().unwrap();
-        let reason = call.check_retry_needed(&output, retry_config);
-        assert!(reason.is_some());
-        assert!(reason.unwrap().contains("score 1.5 outside"));
-
-        // Valid JSON with valid score
-        let output = call.build_output(r#"{"score": 0.8}"#.into());
-        assert!(call.check_retry_needed(&output, retry_config).is_none());
-    }
-
-    #[test]
-    fn test_transport_retry_populates_diagnostics() {
-        let mut transport_retries: u32 = 0;
-        let mut backoff_total_ms: u64 = 0;
-
-        let mut on_retry = |attempt: u32, delay: std::time::Duration, _reason: &str| {
-            transport_retries = attempt;
-            backoff_total_ms += delay.as_millis() as u64;
-        };
-
-        on_retry(1, std::time::Duration::from_millis(500), "429 Too Many Requests");
-        on_retry(2, std::time::Duration::from_millis(1000), "503 Service Unavailable");
-
-        assert_eq!(transport_retries, 2);
-        assert_eq!(backoff_total_ms, 1500);
-    }
-
-    #[test]
-    fn test_llm_call_accessors() {
-        let call = LlmCall::new("test", "Hello {input}")
-            .with_model("llama3.2:3b")
-            .with_streaming(true)
-            .expecting_json();
-        assert_eq!(call.name(), "test");
-        assert_eq!(call.model(), "llama3.2:3b");
-        assert!(call.is_streaming());
-        assert!(matches!(call.output_strategy(), OutputStrategy::Json));
-        assert_eq!(call.prompt_template(), "Hello {input}");
-        assert!(call.system_template().is_none());
-        assert!(call.retry().is_none());
-    }
-}
+#[path = "llm_call_tests.rs"]
+mod tests;

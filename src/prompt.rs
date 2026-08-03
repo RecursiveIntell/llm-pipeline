@@ -106,14 +106,22 @@ mod tests {
     #[test]
     fn test_render_escaped_braces_no_substitution() {
         let ctx = PipelineContext::new();
-        let result = render("Output format: {{\"result\": {{\"value\": 42}}}}", "data", &ctx);
+        let result = render(
+            "Output format: {{\"result\": {{\"value\": 42}}}}",
+            "data",
+            &ctx,
+        );
         assert_eq!(result, r#"Output format: {"result": {"value": 42}}"#);
     }
 
     #[test]
     fn test_render_mixed_escaped_and_placeholder() {
         let ctx = PipelineContext::new().insert("schema", "string");
-        let result = render("Type is {schema}, format: {{\"type\": \"object\"}}", "x", &ctx);
+        let result = render(
+            "Type is {schema}, format: {{\"type\": \"object\"}}",
+            "x",
+            &ctx,
+        );
         assert_eq!(result, r#"Type is string, format: {"type": "object"}"#);
     }
 }

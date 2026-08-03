@@ -6,6 +6,7 @@
 
 use crate::error::Result;
 use crate::PipelineError;
+use llm_output_parser::extract::{extract_code_block, extract_code_block_for, find_bracketed};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -42,16 +43,10 @@ pub fn extract_thinking(text: &str) -> (Option<String>, String) {
 ///
 /// Recognizes `` ```json ``, `` ```JSON ``, and plain `` ``` `` fences.
 pub fn extract_json_block(text: &str) -> Option<String> {
-    let markers = ["```json", "```JSON", "```"];
-    for marker in markers {
-        if let Some(start) = text.find(marker) {
-            let content_start = start + marker.len();
-            if let Some(end) = text[content_start..].find("```") {
-                return Some(text[content_start..content_start + end].trim().to_string());
-            }
-        }
-    }
-    None
+    let trimmed = text.trim();
+    extract_code_block_for(trimmed, "json")
+        .map(str::to_string)
+        .or_else(|| extract_code_block(trimmed).map(|(_, content)| content.to_string()))
 }
 
 /// Try to locate and extract a JSON object or array from text that may
@@ -68,25 +63,9 @@ pub fn extract_json_candidate(text: &str) -> Option<String> {
         return Some(block);
     }
 
-    // Find first { or [
-    if let Some(idx) = trimmed.find('{').or_else(|| trimmed.find('[')) {
-        let candidate = &trimmed[idx..];
-        // Try parsing the whole remainder
-        if serde_json::from_str::<Value>(candidate).is_ok() {
-            return Some(candidate.to_string());
-        }
-        // Try finding matching closing brace/bracket
-        let open = candidate.as_bytes()[0];
-        let close = if open == b'{' { b'}' } else { b']' };
-        if let Some(end) = candidate.rfind(close as char) {
-            let substr = &candidate[..=end];
-            if serde_json::from_str::<Value>(substr).is_ok() {
-                return Some(substr.to_string());
-            }
-        }
-    }
-
-    None
+    find_bracketed(trimmed, '{', '}')
+        .map(str::to_string)
+        .or_else(|| find_bracketed(trimmed, '[', ']').map(str::to_string))
 }
 
 /// Parse text into a `serde_json::Value` losslessly.
@@ -96,42 +75,18 @@ pub fn extract_json_candidate(text: &str) -> Option<String> {
 pub fn parse_value_lossy(text: &str) -> Value {
     let trimmed = text.trim();
 
-    // Direct parse
-    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-        return val;
-    }
-
-    // Extract from blocks or embedded JSON
-    if let Some(candidate) = extract_json_candidate(trimmed) {
-        if let Ok(val) = serde_json::from_str::<Value>(&candidate) {
-            return val;
-        }
-    }
-
-    // Fall back to wrapping as string
-    Value::String(trimmed.to_string())
+    llm_output_parser::parse_json_value(trimmed)
+        .unwrap_or_else(|_| Value::String(trimmed.to_string()))
 }
 
 /// Parse text into a `serde_json::Value`, requiring valid JSON.
 ///
 /// Tries defensive extraction but returns an error if no valid JSON is found.
 pub fn parse_value_defensively(text: &str) -> Result<Value> {
-    let trimmed = text.trim();
-
-    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-        return Ok(val);
-    }
-
-    if let Some(candidate) = extract_json_candidate(trimmed) {
-        if let Ok(val) = serde_json::from_str::<Value>(&candidate) {
-            return Ok(val);
-        }
-    }
-
-    Err(PipelineError::Other(format!(
-        "No valid JSON found in LLM output. Raw text (truncated): {}",
-        &trimmed[..trimmed.len().min(200)]
-    )))
+    llm_output_parser::parse_json_value(text.trim()).map_err(|source| PipelineError::Parse {
+        strategy: "json",
+        source,
+    })
 }
 
 /// Parse text into a typed `T` with defensive JSON extraction.
@@ -139,40 +94,10 @@ pub fn parse_value_defensively(text: &str) -> Result<Value> {
 /// Tries direct parse, markdown block extraction, and embedded JSON detection.
 /// This is the typed equivalent of [`parse_value_defensively`].
 pub fn parse_as<T: DeserializeOwned>(text: &str) -> Result<T> {
-    let trimmed = text.trim();
-
-    // Try direct parse
-    if let Ok(val) = serde_json::from_str::<T>(trimmed) {
-        return Ok(val);
-    }
-
-    // Try extracting JSON from markdown code blocks
-    if let Some(json_str) = extract_json_block(trimmed) {
-        if let Ok(val) = serde_json::from_str::<T>(&json_str) {
-            return Ok(val);
-        }
-    }
-
-    // Try finding first { or [ and parsing from there
-    if let Some(idx) = trimmed.find('{').or_else(|| trimmed.find('[')) {
-        let candidate = &trimmed[idx..];
-        if let Ok(val) = serde_json::from_str::<T>(candidate) {
-            return Ok(val);
-        }
-        let open = candidate.as_bytes()[0];
-        let close = if open == b'{' { b'}' } else { b']' };
-        if let Some(end) = candidate.rfind(close as char) {
-            let substr = &candidate[..=end];
-            if let Ok(val) = serde_json::from_str::<T>(substr) {
-                return Ok(val);
-            }
-        }
-    }
-
-    Err(PipelineError::Other(format!(
-        "Failed to parse LLM output as expected type. Raw text (truncated): {}",
-        &trimmed[..trimmed.len().min(200)]
-    )))
+    llm_output_parser::parse_json(text.trim()).map_err(|source| PipelineError::Parse {
+        strategy: "json",
+        source,
+    })
 }
 
 #[cfg(test)]

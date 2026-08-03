@@ -1,21 +1,33 @@
+#[allow(deprecated)]
+use crate::trace::TraceId;
 use crate::{
     error::Result,
+    events::{Event, FnEventHandler},
     exec_ctx::ExecCtx,
     llm_call::LlmCall,
-    parsing,
     payload::Payload,
     stage::Stage,
-    streaming::StreamingDecoder,
-    types::{PipelineContext, PipelineInput, PipelineProgress, PipelineResult, StageOutput},
+    types::{
+        BudgetDebitV1, ExecutionOutcome, PipelineContext, PipelineExecutionReceiptV1,
+        PipelineInput, PipelineProgress, PipelineResult, ProviderCallReceiptV1, RetryCause,
+        RetryDecision, RetryDecisionReceiptV1, StageOutput,
+    },
     PipelineError,
 };
-use futures::StreamExt;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use tokio::sync::mpsc;
+
+/// SHA-256 digest helper for receipts.
+fn sha256_digest(data: &str) -> String {
+    format!("{:x}", Sha256::digest(data.as_bytes()))
+}
 
 /// Pipeline executor for multi-stage LLM workflows.
 ///
@@ -33,6 +45,8 @@ where
     context: PipelineContext,
     cancellation: Option<Arc<AtomicBool>>,
     _phantom: std::marker::PhantomData<T>,
+    /// The last execution receipt, populated after each `execute_*` call.
+    last_receipt: RefCell<Option<PipelineExecutionReceiptV1>>,
 }
 
 impl<T> std::fmt::Debug for Pipeline<T>
@@ -66,6 +80,11 @@ where
     /// Get a reference to the pipeline's stages.
     pub fn stages(&self) -> &[Stage] {
         &self.stages
+    }
+
+    /// Returns the last execution receipt, if any.
+    pub fn last_receipt(&self) -> Option<PipelineExecutionReceiptV1> {
+        self.last_receipt.borrow().clone()
     }
 
     /// Check whether cancellation has been requested.
@@ -134,6 +153,9 @@ where
 
         let mut current_input = Value::String(input.idea);
         let mut stage_results = Vec::new();
+        let mut provider_calls = Vec::new();
+        let mut retry_decisions = Vec::new();
+        let budget_debits = Vec::new();
 
         for (idx, payload) in &payloads {
             self.check_cancelled()?;
@@ -146,14 +168,181 @@ where
                 total_steps: None,
             });
 
-            let output = payload.invoke(&ctx, current_input).await.map_err(|e| {
-                PipelineError::StageFailed {
+            let start = std::time::Instant::now();
+            let output = payload
+                .invoke(&ctx, current_input.clone())
+                .await
+                .map_err(|e| PipelineError::StageFailed {
                     stage: payload.name().to_string(),
                     message: e.to_string(),
+                })?;
+            let latency_ms = start.elapsed().as_millis() as u64;
+
+            // Emit a ProviderCallReceiptV1 for this stage's LLM call.
+            let traceparent = ctx.trace_ctx.to_traceparent().ok();
+            provider_calls.push(ProviderCallReceiptV1 {
+                integrity_tag: None,
+                previous_receipt_digest: None,
+                traceparent: traceparent.clone(),
+                tracestate: None,
+                receipt_id: uuid::Uuid::new_v4().to_string(),
+                provider: ctx.backend.name().to_string(),
+                model_route: payload.model().to_string(),
+                request_digest: sha256_digest(
+                    &serde_json::to_string(&current_input).unwrap_or_default(),
+                ),
+                response_digest: sha256_digest(&output.raw_response),
+                latency_ms,
+                tokens_in: output
+                    .token_usage
+                    .as_ref()
+                    .map(|u| u.prompt_tokens as u64)
+                    .unwrap_or(0),
+                tokens_out: output
+                    .token_usage
+                    .as_ref()
+                    .map(|u| u.completion_tokens as u64)
+                    .unwrap_or(0),
+            });
+
+            // Emit RetryDecisionReceiptV1 entries from diagnostics if present.
+            if let Some(ref diag) = output.diagnostics {
+                if diag.retry_attempts > 0 {
+                    retry_decisions.push(RetryDecisionReceiptV1 {
+                        receipt_id: uuid::Uuid::new_v4().to_string(),
+                        attempt_number: diag.retry_attempts,
+                        max_attempts: payload.retry().map(|r| r.max_retries).unwrap_or(0),
+                        cause: RetryCause::ParseError(diag.parse_error.clone().unwrap_or_default()),
+                        decision: RetryDecision::Retrying,
+                        budget_impact: BudgetDebitV1 {
+                            budget_id: "default".to_string(),
+                            debit: 0.0,
+                            remaining: 0.0,
+                        },
+                    });
                 }
-            })?;
+            }
 
             // Parse into T from the structured output value
+            let parsed: T = output.parse_as().map_err(|e| PipelineError::StageFailed {
+                stage: payload.name().to_string(),
+                message: e.to_string(),
+            })?;
+
+            current_input = output.value;
+            stage_results.push(StageOutput {
+                output: parsed,
+                thinking: output.thinking,
+                raw_response: output.raw_response,
+            });
+        }
+
+        let final_output = stage_results
+            .last()
+            .ok_or_else(|| PipelineError::Other("No stages were executed".to_string()))?
+            .output
+            .clone();
+
+        // Build the execution receipt and store it.
+        let receipt = PipelineExecutionReceiptV1 {
+            receipt_version: "1".to_string(),
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            integrity_tag: None,
+            previous_receipt_digest: None,
+            traceparent: ctx.trace_ctx.to_traceparent().ok(),
+            tracestate: None,
+            chain_valid: false,
+            receipt_id: uuid::Uuid::new_v4().to_string(),
+            pipeline_id: format!("pipeline-{}", stages_enabled.iter().filter(|&&b| b).count()),
+            provider_calls,
+            retry_decisions,
+            budget_debits,
+            response_digest: sha256_digest(
+                &serde_json::to_string(&final_output).unwrap_or_default(),
+            ),
+            outcome: ExecutionOutcome::Success,
+            recorded_time: chrono::Utc::now(),
+        };
+        *self.last_receipt.borrow_mut() = Some(receipt);
+
+        Ok(PipelineResult {
+            final_output,
+            stage_results,
+            stages_enabled,
+        })
+    }
+
+    /// Execute the pipeline with streaming LLM calls and per-token callbacks.
+    ///
+    /// Uses buffered line-framing to correctly handle JSON lines split across
+    /// chunk boundaries.
+    ///
+    /// `on_progress` is called at the start of each stage.
+    /// `on_token` is called for each token received from the LLM.
+    #[allow(deprecated)]
+    pub async fn execute_streaming<F, G>(
+        &self,
+        client: &Client,
+        endpoint: &str,
+        input: PipelineInput,
+        mut on_progress: F,
+        mut on_token: G,
+    ) -> Result<PipelineResult<T>>
+    where
+        F: FnMut(PipelineProgress),
+        G: FnMut(usize, &str),
+    {
+        let trace_id = TraceId::new();
+        let payloads = self.build_payloads(true);
+        let stages_enabled: Vec<bool> = self.stages.iter().map(|s| s.enabled).collect();
+        let total_stages = self.stages.len();
+
+        let mut current_input = Value::String(input.idea);
+        let mut stage_results = Vec::new();
+
+        for (idx, payload) in &payloads {
+            self.check_cancelled()?;
+
+            on_progress(PipelineProgress {
+                stage_index: *idx,
+                total_stages,
+                stage_name: payload.name().to_string(),
+                current_step: None,
+                total_steps: None,
+            });
+
+            let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+            let stage_idx = *idx;
+            let handler = Arc::new(FnEventHandler(move |event: Event| {
+                if let Event::Token { chunk, .. } = event {
+                    let _ = tx.send(chunk);
+                }
+            }));
+            let stage_ctx = ExecCtx::builder(endpoint)
+                .client(client.clone())
+                .vars(self.context.data.clone())
+                .cancellation(self.cancellation.clone())
+                .event_handler(handler)
+                .with_trace_id(trace_id.clone())
+                .build();
+
+            let invoke = payload.invoke(&stage_ctx, current_input);
+            tokio::pin!(invoke);
+
+            let output = loop {
+                tokio::select! {
+                    Some(chunk) = rx.recv() => {
+                        on_token(stage_idx, &chunk);
+                    }
+                    result = &mut invoke => {
+                        break result.map_err(|e| PipelineError::StageFailed {
+                            stage: payload.name().to_string(),
+                            message: e.to_string(),
+                        })?;
+                    }
+                }
+            };
+
             let parsed: T = output.parse_as().map_err(|e| PipelineError::StageFailed {
                 stage: payload.name().to_string(),
                 message: e.to_string(),
@@ -178,178 +367,6 @@ where
             stage_results,
             stages_enabled,
         })
-    }
-
-    /// Execute the pipeline with streaming LLM calls and per-token callbacks.
-    ///
-    /// Uses buffered line-framing to correctly handle JSON lines split across
-    /// chunk boundaries.
-    ///
-    /// `on_progress` is called at the start of each stage.
-    /// `on_token` is called for each token received from the LLM.
-    pub async fn execute_streaming<F, G>(
-        &self,
-        client: &Client,
-        endpoint: &str,
-        input: PipelineInput,
-        mut on_progress: F,
-        mut on_token: G,
-    ) -> Result<PipelineResult<T>>
-    where
-        F: FnMut(PipelineProgress),
-        G: FnMut(usize, &str),
-    {
-        let ctx = self.build_ctx(client, endpoint);
-        let payloads = self.build_payloads(false); // don't use payload streaming path
-        let stages_enabled: Vec<bool> = self.stages.iter().map(|s| s.enabled).collect();
-        let total_stages = self.stages.len();
-
-        let mut current_input = Value::String(input.idea);
-        let mut stage_results = Vec::new();
-
-        for (idx, payload) in &payloads {
-            self.check_cancelled()?;
-
-            on_progress(PipelineProgress {
-                stage_index: *idx,
-                total_stages,
-                stage_name: payload.name().to_string(),
-                current_step: None,
-                total_steps: None,
-            });
-
-            // For streaming, we call the Ollama API directly with the callback
-            let input_str = match &current_input {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-
-            let prompt = {
-                let mut rendered = payload.prompt_template().replace("{input}", &input_str);
-                for (key, value) in &ctx.vars {
-                    let placeholder = format!("{{{}}}", key);
-                    rendered = rendered.replace(&placeholder, value);
-                }
-                rendered
-            };
-
-            let raw_response = self
-                .stream_call(client, endpoint, payload, &prompt, *idx, &mut on_token)
-                .await
-                .map_err(|e| PipelineError::StageFailed {
-                    stage: payload.name().to_string(),
-                    message: e.to_string(),
-                })?;
-
-            let (thinking, cleaned) = parsing::extract_thinking(&raw_response);
-            let parsed: T = crate::output_parser::parse_json(&cleaned).map_err(|e| {
-                PipelineError::StageFailed {
-                    stage: payload.name().to_string(),
-                    message: e.to_string(),
-                }
-            })?;
-
-            current_input = parsing::parse_value_lossy(&cleaned);
-            stage_results.push(StageOutput {
-                output: parsed,
-                thinking,
-                raw_response,
-            });
-        }
-
-        let final_output = stage_results
-            .last()
-            .ok_or_else(|| PipelineError::Other("No stages were executed".to_string()))?
-            .output
-            .clone();
-
-        Ok(PipelineResult {
-            final_output,
-            stage_results,
-            stages_enabled,
-        })
-    }
-
-    /// Perform a single streaming call to Ollama, using buffered line framing.
-    async fn stream_call<G>(
-        &self,
-        client: &Client,
-        endpoint: &str,
-        payload: &LlmCall,
-        prompt: &str,
-        stage_idx: usize,
-        on_token: &mut G,
-    ) -> Result<String>
-    where
-        G: FnMut(usize, &str),
-    {
-        let config = payload.config();
-        let mut body = json!({
-            "model": payload.model(),
-            "prompt": prompt,
-            "stream": true,
-            "options": {
-                "temperature": config.temperature,
-                "num_predict": config.max_tokens,
-            },
-        });
-
-        if config.thinking {
-            body["options"]["extended_thinking"] = json!(true);
-        }
-
-        if config.json_mode {
-            body["format"] = json!("json");
-        }
-
-        // Merge custom options
-        if let Some(ref opts) = config.options {
-            if let Some(options) = body["options"].as_object_mut() {
-                if let Some(custom) = opts.as_object() {
-                    for (k, v) in custom {
-                        options.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
-
-        let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
-        let resp = client.post(&url).json(&body).send().await.map_err(|e| {
-            PipelineError::Other(format!("Failed to connect to LLM at {}: {}", url, e))
-        })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(PipelineError::Other(format!(
-                "LLM returned error {}: {}",
-                status, text
-            )));
-        }
-
-        let mut stream = resp.bytes_stream();
-        let mut decoder = StreamingDecoder::new();
-        let mut accumulated = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(PipelineError::Request)?;
-            for json_val in decoder.decode(&chunk) {
-                if let Some(response) = json_val.get("response").and_then(|v| v.as_str()) {
-                    accumulated.push_str(response);
-                    on_token(stage_idx, response);
-                }
-            }
-        }
-
-        // Flush remaining buffer
-        if let Some(json_val) = decoder.flush() {
-            if let Some(response) = json_val.get("response").and_then(|v| v.as_str()) {
-                accumulated.push_str(response);
-                on_token(stage_idx, response);
-            }
-        }
-
-        Ok(accumulated)
     }
 }
 
@@ -415,6 +432,7 @@ where
             context: self.context,
             cancellation: self.cancellation,
             _phantom: std::marker::PhantomData,
+            last_receipt: RefCell::new(None),
         })
     }
 }

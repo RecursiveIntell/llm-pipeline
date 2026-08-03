@@ -12,6 +12,16 @@ pub enum PipelineError {
     #[error("JSON parsing failed: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Structured output parsing failed in `llm-output-parser`.
+    #[error("Output parsing failed for {strategy}: {source}")]
+    Parse {
+        /// Parser surface being used (`json`, `string_list`, etc.).
+        strategy: &'static str,
+        /// Underlying parser error with preserved context.
+        #[source]
+        source: llm_output_parser::ParseError,
+    },
+
     /// A pipeline stage failed with a descriptive message.
     #[error("Stage '{stage}' failed: {message}")]
     StageFailed { stage: String, message: String },
@@ -39,9 +49,75 @@ pub enum PipelineError {
         retry_after: Option<Duration>,
     },
 
+    /// LLM response exceeded the configured size limit.
+    #[error("Response too large: {size} bytes exceeds limit of {limit} bytes")]
+    ResponseTooLarge {
+        /// Actual response size in bytes.
+        size: usize,
+        /// Configured limit in bytes.
+        limit: usize,
+    },
+
+    /// No tokens received within the configured stream idle timeout.
+    #[error("Stream idle: no tokens received for {idle_ms}ms (limit: {limit_ms}ms)")]
+    StreamIdle {
+        /// Duration of silence in milliseconds.
+        idle_ms: u64,
+        /// Configured idle limit in milliseconds.
+        limit_ms: u64,
+    },
+
+    /// Operation exceeded the configured wall-clock timeout.
+    #[error("Timeout: operation took {elapsed_ms}ms (limit: {limit_ms}ms)")]
+    Timeout {
+        /// Elapsed time in milliseconds.
+        elapsed_ms: u64,
+        /// Configured timeout in milliseconds.
+        limit_ms: u64,
+    },
+
+    /// Requested a structured-generation constraint the backend cannot satisfy.
+    #[error("Unsupported constraint for backend '{backend}': {constraint}")]
+    UnsupportedConstraint {
+        /// Backend name.
+        backend: String,
+        /// Human-readable constraint summary.
+        constraint: String,
+    },
+
+    /// Token budget exceeded for this pipeline context.
+    #[error("Token budget exceeded: used {used} tokens, limit {limit} tokens")]
+    BudgetExceeded {
+        /// Tokens already consumed in the context.
+        used: u32,
+        /// Configured token budget.
+        limit: u32,
+    },
+
     /// Catch-all for other errors.
     #[error("{0}")]
     Other(String),
+}
+
+impl PipelineError {
+    /// Returns a stable string discriminant for programmatic matching.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Request(_) => "request",
+            Self::Json(_) => "json",
+            Self::Parse { .. } => "parse",
+            Self::StageFailed { .. } => "stage_failed",
+            Self::Cancelled => "cancelled",
+            Self::InvalidConfig(_) => "invalid_config",
+            Self::HttpError { .. } => "http_error",
+            Self::ResponseTooLarge { .. } => "response_too_large",
+            Self::StreamIdle { .. } => "stream_idle",
+            Self::Timeout { .. } => "timeout",
+            Self::UnsupportedConstraint { .. } => "unsupported_constraint",
+            Self::BudgetExceeded { .. } => "budget_exceeded",
+            Self::Other(_) => "other",
+        }
+    }
 }
 
 impl From<anyhow::Error> for PipelineError {
