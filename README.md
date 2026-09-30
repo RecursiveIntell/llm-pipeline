@@ -33,11 +33,11 @@ Use `Chain` when the workflow is sequential. Use `agent-graph` when you need con
 
 ## Install
 
-The published package uses registry dependencies and is ready for external consumers:
+The published package uses registry dependencies. Add it to an existing Cargo project:
 
 ```bash
 cargo add llm-pipeline
-cargo test -p llm-pipeline
+cargo check
 ```
 
 To validate the checked-out repository itself:
