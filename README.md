@@ -1,5 +1,7 @@
 # llm-pipeline
 
+<!-- last-verified: 2026-10-25; scope: YAML feature documentation and source mapping -->
+
 A Rust library for composing provider-backed LLM payloads with explicit prompt rendering, typed extraction, defensive output parsing, streaming, transport retries, semantic retries, limits, events, and receipts-oriented metadata.
 
 The primary API is payload-oriented:
@@ -231,12 +233,14 @@ Use `execute_all` when intermediate outputs and their diagnostics are required. 
 | `AnthropicBackend` | `--features anthropic` | Anthropic Messages API and SSE path |
 | `MockBackend` | Always compiled | Fixed or test-controlled responses; no network required |
 | `RecordingBackend` | Always compiled | Records backend interactions around another backend |
+| `yaml` feature | `--features yaml` | Enables the `parse_yaml` API via `llm_pipeline::output_parser` |
 
 Feature examples:
 
 ```bash
 cargo check -p llm-pipeline --features openai
 cargo check -p llm-pipeline --features anthropic
+cargo check -p llm-pipeline --features yaml
 cargo test -p llm-pipeline --all-features
 ```
 
